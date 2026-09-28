@@ -7,17 +7,17 @@
 
 int main()
 {
-    AVFormatContext* formatCtx = NULL;
-    AVCodecContext* codecCtx = NULL;
-    AVCodec* codec = NULL;
-    AVFrame* frame = NULL;
+    AVFormatContext *formatCtx = NULL;
+    AVCodecContext *codecCtx = NULL;
+    AVCodec *codec = NULL;
+    AVFrame *frame = NULL;
     AVPacket packet;
     int videoStreamIndex = -1;
     int64_t time = 10; // Tempo em segundos
     int64_t timestamp = 0;
     int gotFrame = 0;
-    struct SwsContext* swsCtx = NULL;
-    uint8_t* buffer = NULL;
+    struct SwsContext *swsCtx = NULL;
+    uint8_t *buffer = NULL;
     int bufferWidth, bufferHeight;
     int ret;
 
@@ -154,7 +154,7 @@ int main()
                               (const int[]){bufferWidth * 3});
 
                     // Salva a imagem em um arquivo PPM
-                    FILE* fp = fopen("frame.ppm", "wb");
+                    FILE *fp = fopen("frame.ppm", "wb");
                     fprintf(fp, "P6\n%d %d\n255\n", bufferWidth,
                             bufferHeight);
                     fwrite(buffer, 1, bufferWidth * bufferHeight * 3, fp);
