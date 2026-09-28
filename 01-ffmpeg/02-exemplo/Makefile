@@ -20,7 +20,7 @@ clean:
 	rm -f $(TARGET) $(TARGET).o video.mp4 video.avi
 
 run:
-	cp ../01/video.mp4 .
+	cp ../01-exemplo/video.mp4 .
 	./main video.mp4 video.avi
 
 show: video.avi
