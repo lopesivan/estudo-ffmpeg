@@ -1,0 +1,14 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-c",
+      "-o",
+      "main",
+      "main.c"
+    ],
+    "directory": "/home/ivan/git/curl/01",
+    "file": "/home/ivan/git/curl/01/main.c",
+    "output": "/home/ivan/git/curl/01/main"
+  }
+]
