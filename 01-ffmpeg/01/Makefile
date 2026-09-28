@@ -1,9 +1,21 @@
-# Makefile: A standard Makefile for main.c
+# Makefile: compila main.c usando FFmpeg (libavutil, libavformat, libswscale, libavcodec)
 
-CFLAGS = `pkg-config --cflags libavutil libavformat libswscale libavcodec`
-LDLIBS = `pkg-config --libs libavutil libavformat libswscale libavcodec`
+PKG_CONFIG_PATH ?= /usr/lib/x86_64-linux-gnu/pkgconfig
+PKGS     := libavutil libavformat libswscale libavcodec
+CC       ?= cc
+CFLAGS   += -Wall -Wextra -O2 $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags $(PKGS))
+LDLIBS   := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs $(PKGS))
 
-all  : main
+TARGET := main
+SRC    := main.c
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
 clean:
-	/bin/rm -rf main main.o 
+	rm -f $(TARGET) $(TARGET).o frame.ppm
 # END OF FILE
