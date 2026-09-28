@@ -1,0 +1,256 @@
+
+Claro! Aqui vão mais 3 algoritmos clássicos de detecção de bordas, no mesmo estilo (imagem RGB com conversão para cinza e aplicação de um kernel). Todos seguem a estrutura da sua ImagemRGB.
+
+
+---
+
+1. Filtro de Roberts (rápido e simples)
+
+Opera com um pequeno kernel 2x2 e detecta bordas diagonais.
+
+void filtro_roberts(const uint8_t *cinza, int largura, int altura, uint8_t *bordas) {
+    for (int y = 0; y < altura - 1; y++) {
+        for (int x = 0; x < largura - 1; x++) {
+            int idx = y * largura + x;
+            int gx = cinza[idx] - cinza[idx + largura + 1];
+            int gy = cinza[idx + 1] - cinza[idx + largura];
+
+            int mag = abs(gx) + abs(gy);
+            if (mag > 255) mag = 255;
+            bordas[idx] = (uint8_t)mag;
+        }
+    }
+}
+
+
+---
+
+2. Prewitt (semelhante a Sobel, mas mais simples)
+
+A máscara é parecida com Sobel, mas com pesos uniformes.
+
+void filtro_prewitt(const uint8_t *cinza, int largura, int altura, uint8_t *bordas) {
+    int gx[3][3] = {
+        {-1, 0, 1},
+        {-1, 0, 1},
+        {-1, 0, 1}
+    };
+
+    int gy[3][3] = {
+        {-1, -1, -1},
+        { 0,  0,  0},
+        { 1,  1,  1}
+    };
+
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int sumX = 0, sumY = 0;
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int pixel = cinza[(y + ky) * largura + (x + kx)];
+                    sumX += pixel * gx[ky + 1][kx + 1];
+                    sumY += pixel * gy[ky + 1][kx + 1];
+                }
+            }
+
+            int mag = sqrt(sumX * sumX + sumY * sumY);
+            if (mag > 255) mag = 255;
+            bordas[y * largura + x] = (uint8_t)mag;
+        }
+    }
+}
+
+
+---
+
+3. Detecção por Diferença Absoluta (fácil de entender e implementar)
+
+Compara cada pixel com seus vizinhos e detecta diferenças fortes.
+
+void filtro_diferenca_absoluta(const uint8_t *cinza, int largura, int altura, uint8_t *bordas) {
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int idx = y * largura + x;
+            int atual = cinza[idx];
+            int direita = cinza[idx + 1];
+            int abaixo = cinza[idx + largura];
+
+            int diff = abs(atual - direita) + abs(atual - abaixo);
+            if (diff > 255) diff = 255;
+
+            bordas[idx] = (uint8_t)diff;
+        }
+    }
+}
+
+
+---
+
+Quer que eu monte um cabeçalho .h com todos esses filtros organizados para uso modular?
+
+
+
+Perfeito! Aqui está um exemplo de cabeçalho .h organizado com os filtros de detecção de bordas que discutimos, incluindo as funções auxiliares para conversão RGB para escala de cinza.
+
+
+---
+
+filtros_borda.h
+
+#ifndef FILTROS_BORDA_H
+#define FILTROS_BORDA_H
+
+#include <stdint.h>
+
+typedef struct
+{
+    int id;
+    int largura;
+    int altura;
+    uint8_t *dados; // RGB intercalado
+} ImagemRGB;
+
+/* Converte imagem RGB para tons de cinza (1 byte por pixel) */
+void converter_para_cinza(const ImagemRGB *imagem, uint8_t *cinza);
+
+/* Detecção de bordas usando operador Laplaciano */
+void filtro_laplaciano(const uint8_t *cinza, int largura, int altura, uint8_t *bordas);
+
+/* Detecção de bordas usando operador de Roberts */
+void filtro_roberts(const uint8_t *cinza, int largura, int altura, uint8_t *bordas);
+
+/* Detecção de bordas usando operador de Prewitt */
+void filtro_prewitt(const uint8_t *cinza, int largura, int altura, uint8_t *bordas);
+
+/* Detecção de bordas usando diferença absoluta entre pixels */
+void filtro_diferenca_absoluta(const uint8_t *cinza, int largura, int altura, uint8_t *bordas);
+
+#endif // FILTROS_BORDA_H
+
+
+---
+
+Se quiser, também posso gerar o arquivo .c de implementação com todos os filtros prontos para compilação. Quer que eu monte isso agora?
+
+
+
+
+Ótimo! Aqui vão mais 3 algoritmos clássicos de detecção de bordas que você pode implementar e adicionar ao seu projeto com a estrutura ImagemRGB.
+
+
+---
+
+4. Filtro de Kirsch
+
+Detecta bordas em 8 direções (N, NE, E, SE, S, SW, W, NW). Usa um conjunto de 8 máscaras rotacionadas. É mais pesado, mas robusto.
+
+void filtro_kirsch(const uint8_t *cinza, int largura, int altura, uint8_t *bordas) {
+    int kirsch_masks[8][3][3] = {
+        { { 5,  5,  5}, {-3,  0, -3}, {-3, -3, -3} }, // N
+        { { 5,  5, -3}, { 5,  0, -3}, {-3, -3, -3} }, // NE
+        { { 5, -3, -3}, { 5,  0, -3}, { 5, -3, -3} }, // E
+        { {-3, -3, -3}, { 5,  0, -3}, { 5,  5, -3} }, // SE
+        { {-3, -3, -3}, {-3,  0, -3}, { 5,  5,  5} }, // S
+        { {-3, -3, -3}, {-3,  0,  5}, {-3,  5,  5} }, // SW
+        { {-3, -3,  5}, {-3,  0,  5}, {-3, -3,  5} }, // W
+        { {-3,  5,  5}, {-3,  0,  5}, {-3, -3, -3} }  // NW
+    };
+
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int max_resp = 0;
+
+            for (int k = 0; k < 8; k++) {
+                int resp = 0;
+
+                for (int ky = -1; ky <= 1; ky++) {
+                    for (int kx = -1; kx <= 1; kx++) {
+                        int pixel = cinza[(y + ky) * largura + (x + kx)];
+                        resp += pixel * kirsch_masks[k][ky + 1][kx + 1];
+                    }
+                }
+
+                if (resp > max_resp) max_resp = resp;
+            }
+
+            if (max_resp > 255) max_resp = 255;
+            bordas[y * largura + x] = (uint8_t)max_resp;
+        }
+    }
+}
+
+
+---
+
+5. Canny (versão simplificada)
+
+É o mais robusto, mas também o mais complexo (envolve suavização, gradiente, supressão não máxima e histerese). Aqui está um esboço simplificado sem a parte de histerese:
+
+// Canny requer: 1) Suavização (ex: gaussiano), 2) Gradiente (Sobel), 3) Supressão não máxima (simplificada aqui)
+
+// Você já tem Sobel; veja abaixo uma suavização gaussiana simples:
+void suavizacao_gaussiana3x3(const uint8_t *in, int largura, int altura, uint8_t *out) {
+    int kernel[3][3] = {
+        {1, 2, 1},
+        {2, 4, 2},
+        {1, 2, 1}
+    };
+
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int soma = 0;
+            int peso = 0;
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int p = in[(y + ky) * largura + (x + kx)];
+                    soma += p * kernel[ky + 1][kx + 1];
+                    peso += kernel[ky + 1][kx + 1];
+                }
+            }
+            out[y * largura + x] = soma / peso;
+        }
+    }
+}
+
+Para implementar o Canny completo, eu posso montar para você com todos os passos, se desejar.
+
+
+---
+
+6. Laplaciano do Gaussiano (LoG)
+
+É o Laplaciano aplicado após suavização gaussiana – remove ruído antes da detecção.
+
+void filtro_log(const uint8_t *cinza, int largura, int altura, uint8_t *bordas) {
+    // Kernel 5x5 aproximado do LoG (sigma ≈ 1.4)
+    int log_kernel[5][5] = {
+        { 0,  0, -1,  0,  0},
+        { 0, -1, -2, -1,  0},
+        {-1, -2, 16, -2, -1},
+        { 0, -1, -2, -1,  0},
+        { 0,  0, -1,  0,  0}
+    };
+
+    for (int y = 2; y < altura - 2; y++) {
+        for (int x = 2; x < largura - 2; x++) {
+            int soma = 0;
+            for (int ky = -2; ky <= 2; ky++) {
+                for (int kx = -2; kx <= 2; kx++) {
+                    int p = cinza[(y + ky) * largura + (x + kx)];
+                    soma += p * log_kernel[ky + 2][kx + 2];
+                }
+            }
+            if (soma < 0) soma = 0;
+            if (soma > 255) soma = 255;
+            bordas[y * largura + x] = (uint8_t)soma;
+        }
+    }
+}
+
+
+---
+
+Esses três algoritmos ampliam a detecção para diferentes necessidades: Kirsch (direções), LoG (suavização + bordas) e Canny (precisão). Quer que eu adicione todos ao .h e gere um filtros_borda.c correspondente?
+
+
+

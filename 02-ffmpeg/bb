@@ -1,0 +1,279 @@
+
+Perfeito. Vamos usar a estrutura ImagemRGB que você forneceu para aplicar outro algoritmo de detecção de bordas, desta vez usando um filtro Laplaciano, que é um operador que detecta regiões onde a intensidade muda rapidamente (bordas) usando uma única máscara.
+
+1. Conversão para escala de cinza
+
+2. Aplicação do kernel Laplaciano
+
+
+---
+
+Código C com filtro Laplaciano:
+
+#include <stdlib.h>
+#include <stdint.h>
+
+typedef struct
+{
+    int id;
+    int largura;
+    int altura;
+    uint8_t *dados; // RGB intercalado
+} ImagemRGB;
+
+void converter_para_cinza(const ImagemRGB *imagem, uint8_t *cinza)
+{
+    for (int y = 0; y < imagem->altura; y++) {
+        for (int x = 0; x < imagem->largura; x++) {
+            int idx_rgb = (y * imagem->largura + x) * 3;
+            uint8_t r = imagem->dados[idx_rgb];
+            uint8_t g = imagem->dados[idx_rgb + 1];
+            uint8_t b = imagem->dados[idx_rgb + 2];
+            cinza[y * imagem->largura + x] = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+    }
+}
+
+void filtro_laplaciano(const uint8_t *cinza, int largura, int altura, uint8_t *bordas)
+{
+    int kernel[3][3] = {
+        { 0, -1,  0},
+        {-1,  4, -1},
+        { 0, -1,  0}
+    };
+
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int soma = 0;
+
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int pixel = cinza[(y + ky) * largura + (x + kx)];
+                    soma += pixel * kernel[ky + 1][kx + 1];
+                }
+            }
+
+            if (soma < 0) soma = 0;
+            if (soma > 255) soma = 255;
+
+            bordas[y * largura + x] = (uint8_t)soma;
+        }
+    }
+}
+
+
+---
+
+Como usar:
+
+ImagemRGB imagem;
+// suponha que imagem.largura, imagem.altura e imagem.dados estejam preenchidos
+int total = imagem.largura * imagem.altura;
+
+uint8_t *cinza = malloc(total);
+uint8_t *bordas = malloc(total);
+
+converter_para_cinza(&imagem, cinza);
+filtro_laplaciano(cinza, imagem.largura, imagem.altura, bordas);
+
+// agora 'bordas' contém a imagem em tons de cinza com as bordas realçadas
+
+Esse algoritmo é mais simples e rápido que Sobel, embora menos sensível à direção das bordas. Deseja um exemplo com suavização antes da detecção de bordas?
+
+
+
+Excelente escolha! Abaixo está a implementação completa do algoritmo de Canny em C, adaptada para sua estrutura ImagemRGB. Esse algoritmo envolve 5 etapas principais:
+
+
+---
+
+Etapas do algoritmo de Canny
+
+1. Conversão RGB para cinza
+
+
+2. Suavização (filtro Gaussiano)
+
+
+3. Cálculo de gradiente (Sobel)
+
+
+4. Supressão não máxima
+
+
+5. Histerese com limiares alto e baixo
+
+
+
+
+---
+
+Cabeçalho - filtros_borda.h (adição do Canny)
+
+/* Detecção de bordas com algoritmo completo de Canny */
+void filtro_canny(const ImagemRGB *imagem, uint8_t *bordas, uint8_t limiar_baixo, uint8_t limiar_alto);
+
+
+---
+
+Implementação - filtros_borda.c (versão simplificada do Canny completo)
+
+#include "filtros_borda.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PI 3.14159265
+
+// Conversão RGB → cinza
+void converter_para_cinza(const ImagemRGB *img, uint8_t *cinza) {
+    for (int i = 0; i < img->largura * img->altura; i++) {
+        int r = img->dados[3 * i];
+        int g = img->dados[3 * i + 1];
+        int b = img->dados[3 * i + 2];
+        cinza[i] = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
+    }
+}
+
+// Suavização Gaussiana 3x3
+static void gaussiana(const uint8_t *in, uint8_t *out, int largura, int altura) {
+    int kernel[3][3] = {
+        {1, 2, 1},
+        {2, 4, 2},
+        {1, 2, 1}
+    };
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int soma = 0, peso = 0;
+            for (int ky = -1; ky <= 1; ky++)
+                for (int kx = -1; kx <= 1; kx++) {
+                    int p = in[(y + ky) * largura + (x + kx)];
+                    soma += p * kernel[ky + 1][kx + 1];
+                    peso += kernel[ky + 1][kx + 1];
+                }
+            out[y * largura + x] = soma / peso;
+        }
+    }
+}
+
+// Sobel + direção do gradiente
+static void gradiente(const uint8_t *in, int largura, int altura, float *magnitude, float *direcao) {
+    int gx[3][3] = {
+        {-1, 0, 1},
+        {-2, 0, 2},
+        {-1, 0, 1}
+    };
+    int gy[3][3] = {
+        {-1, -2, -1},
+        { 0,  0,  0},
+        { 1,  2,  1}
+    };
+
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            float sumX = 0, sumY = 0;
+            for (int ky = -1; ky <= 1; ky++)
+                for (int kx = -1; kx <= 1; kx++) {
+                    int p = in[(y + ky) * largura + (x + kx)];
+                    sumX += p * gx[ky + 1][kx + 1];
+                    sumY += p * gy[ky + 1][kx + 1];
+                }
+            int idx = y * largura + x;
+            magnitude[idx] = hypotf(sumX, sumY);
+            direcao[idx] = atan2f(sumY, sumX) * 180.0 / PI;
+            if (direcao[idx] < 0) direcao[idx] += 180;
+        }
+    }
+}
+
+// Supressão não máxima
+static void supressao_nao_maxima(const float *mag, const float *dir, int largura, int altura, uint8_t *saida) {
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int idx = y * largura + x;
+            float ang = dir[idx];
+
+            float v = mag[idx];
+            float viz1 = 0, viz2 = 0;
+
+            // quantização de direção
+            if ((ang >= 0 && ang < 22.5) || (ang >= 157.5 && ang <= 180)) {
+                viz1 = mag[idx - 1];
+                viz2 = mag[idx + 1];
+            } else if (ang >= 22.5 && ang < 67.5) {
+                viz1 = mag[(y - 1) * largura + (x + 1)];
+                viz2 = mag[(y + 1) * largura + (x - 1)];
+            } else if (ang >= 67.5 && ang < 112.5) {
+                viz1 = mag[(y - 1) * largura + x];
+                viz2 = mag[(y + 1) * largura + x];
+            } else if (ang >= 112.5 && ang < 157.5) {
+                viz1 = mag[(y - 1) * largura + (x - 1)];
+                viz2 = mag[(y + 1) * largura + (x + 1)];
+            }
+
+            if (v >= viz1 && v >= viz2)
+                saida[idx] = (uint8_t)(v > 255 ? 255 : v);
+            else
+                saida[idx] = 0;
+        }
+    }
+}
+
+// Histerese com limiares
+static void histerese(uint8_t *img, int largura, int altura, uint8_t baixo, uint8_t alto) {
+    for (int y = 1; y < altura - 1; y++) {
+        for (int x = 1; x < largura - 1; x++) {
+            int idx = y * largura + x;
+            if (img[idx] >= alto) {
+                img[idx] = 255;
+            } else if (img[idx] < baixo) {
+                img[idx] = 0;
+            } else {
+                // Verifica se tem algum vizinho forte
+                int forte = 0;
+                for (int ky = -1; ky <= 1 && !forte; ky++) {
+                    for (int kx = -1; kx <= 1 && !forte; kx++) {
+                        int viz = (y + ky) * largura + (x + kx);
+                        if (img[viz] >= alto)
+                            forte = 1;
+                    }
+                }
+                img[idx] = forte ? 255 : 0;
+            }
+        }
+    }
+}
+
+// Algoritmo completo de Canny
+void filtro_canny(const ImagemRGB *imagem, uint8_t *bordas, uint8_t limiar_baixo, uint8_t limiar_alto) {
+    int N = imagem->largura * imagem->altura;
+
+    uint8_t *cinza = malloc(N);
+    uint8_t *suavizada = malloc(N);
+    float *magnitude = malloc(N * sizeof(float));
+    float *direcao = malloc(N * sizeof(float));
+    uint8_t *suprimida = malloc(N);
+
+    converter_para_cinza(imagem, cinza);
+    gaussiana(cinza, suavizada, imagem->largura, imagem->altura);
+    gradiente(suavizada, imagem->largura, imagem->altura, magnitude, direcao);
+    supressao_nao_maxima(magnitude, direcao, imagem->largura, imagem->altura, suprimida);
+    memcpy(bordas, suprimida, N);
+    histerese(bordas, imagem->largura, imagem->altura, limiar_baixo, limiar_alto);
+
+    free(cinza);
+    free(suavizada);
+    free(magnitude);
+    free(direcao);
+    free(suprimida);
+}
+
+
+---
+
+Esse código está pronto para ser integrado ao seu sistema. Você pode ajustar os limiares limiar_baixo e limiar_alto conforme a sensibilidade desejada, por exemplo:
+
+filtro_canny(&imagem, bordas, 50, 100);
+
+Quer que eu compacte tudo isso em um .zip com os arquivos .h e .c prontos para uso?
+

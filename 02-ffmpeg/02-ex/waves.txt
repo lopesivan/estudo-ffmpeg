@@ -1,0 +1,13 @@
+[0]format=rgba,
+geq=
+r='st(0,80+70*cos(T/2)) ; st(3, X) ; st(4, Y) ;
+ (100 + 27*cos(T*5))  *  mod(      floor(  1 *
+ (  T/2    +   (ld(0)*sin( ( ld(3) -W/2) /ld(0))  +  ld(0)*cos( ( ld(4)  -H/2) /ld(0)))/(115))   / 3  )   ,3)':
+
+g='st(1,80+70*cos(T/2)) ; st(5, X) ; st(6, Y) ;
+ (80   + 40*sin(T*4))  *  mod(  2+  floor(  3 *
+ (  T/2    +   (ld(1)*sin( ( ld(5) -W/2) /ld(1))  +  ld(1)*cos( ( ld(6) -H/2) /ld(1)))/(115))   / 3  )   ,3)':
+
+b='st(2,80+70*cos(T/2)) ; st(7, X) ; st(8, Y) ;
+ ( 50 - 27*cos(T*3))  *  mod( 1+     floor(  9 *
+ (  T/2    +   (ld(2)*sin( ( ld(7) -W/2) /ld(2))  +  ld(2)*cos( ( ld(8) -H/2) /ld(2)))/(115))   / 3  )   ,3)'

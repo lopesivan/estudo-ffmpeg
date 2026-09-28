@@ -1,0 +1,112 @@
+local function app(cmd, args)
+    require("config.nvim_dev").app(cmd, args)
+end
+
+local function input_default(prompt, default)
+    local value = vim.fn.input(prompt, default)
+
+    if value == nil or value == "" then
+        return default
+    end
+
+    return value
+end
+
+return {
+    tasks = {
+        ["run"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+                app(build_dir .. "/app", {})
+            end,
+            type = "lua",
+        },
+
+        ["rm -rf build"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+
+                app("sh", {
+                    "-c",
+                    string.format(
+                        "rm -rf %q",
+                        build_dir
+                    ),
+                })
+            end,
+            type = "lua",
+            desc = "Clean",
+        },
+        ["cmake --build build --clean-first"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+                app("cmake", {
+                    "--build",
+                    build_dir,
+                    "--clean-first",
+                })
+            end,
+            type = "lua",
+            desc = "Clean and Build",
+        },
+
+        ["cmake -S . -B build"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+
+                app("cmake", {
+                    "-S",
+                    ".",
+                    "-B",
+                    build_dir,
+                })
+            end,
+            type = "lua",
+            desc = "Configure",
+        },
+
+        ["cmake --build build"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+
+                app("cmake", {
+                    "--build",
+                    build_dir,
+                })
+            end,
+            type = "lua",
+            desc = "Build",
+        },
+
+        ["ctest --test-dir build_dir --output-on-failure"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+
+                app("ctest", {
+                    "--test-dir",
+                    build_dir,
+                    "--output-on-failure",
+                })
+            end,
+            type = "lua",
+            desc = "Test",
+        },
+
+        ["cmake configure build test"] = {
+            command = function()
+                local build_dir = input_default("Build dir: ", "build")
+
+                app("sh", {
+                    "-c",
+                    string.format(
+                        "cmake -S . -B %q && cmake --build %q && ctest --test-dir %q --output-on-failure",
+                        build_dir,
+                        build_dir,
+                        build_dir
+                    ),
+                })
+            end,
+            type = "lua",
+        },
+    },
+}
