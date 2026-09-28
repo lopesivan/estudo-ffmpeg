@@ -3,7 +3,7 @@
 PKG_CONFIG_PATH ?= /usr/lib/x86_64-linux-gnu/pkgconfig
 PKGS     := libavutil libavformat libswscale libavcodec
 CC       ?= cc
-CFLAGS   += -Wall -Wextra -O2 $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags $(PKGS))
+CFLAGS   += -Wall -Wextra -O2 -DVERBOSE $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags $(PKGS))
 LDLIBS   := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs $(PKGS))
 
 TARGET := main
