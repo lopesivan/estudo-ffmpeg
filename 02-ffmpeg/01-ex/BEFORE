@@ -1,0 +1,6 @@
+# 1. Clone o código-fonte
+git clone https://github.com/ivancarlos/algorithms_with_c.git
+cd algorithms_with_c
+
+# 2. Construa o pacote localmente (adicione --user e --channel durante o create)
+conan create . --user=ivancarlos --channel=stable
