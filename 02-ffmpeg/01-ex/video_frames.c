@@ -48,6 +48,11 @@ void salvar_imagem_em_arquivo(const ImagemRGB *img)
     printf("save: imagem_%03d.ppm\n", img->id); /* Imprime nome do arquivo */
 
     FILE *f = fopen(nome, "wb");
+    if (!f)
+    {
+        fprintf(stderr, "Não foi possível criar %s\n", nome);
+        return;
+    }
     fprintf(f, "P6\n%d %d\n255\n", img->largura,
             img->altura); /* Cabeçalho do formato PPM */
 
@@ -57,6 +62,16 @@ void salvar_imagem_em_arquivo(const ImagemRGB *img)
         fwrite(img->dados + y * img->largura * 3, 1, img->largura * 3, f);
     }
     fclose(f);
+}
+
+/* Satura um valor inteiro em [0, 255], evitando o "wrap" de uint8_t */
+static inline uint8_t clamp_u8(int v)
+{
+    if (v < 0)
+        return 0;
+    if (v > 255)
+        return 255;
+    return (uint8_t)v;
 }
 
 /* desenha um retangulo na imagem: */
@@ -82,17 +97,17 @@ void draw_rectangle(ImagemRGB *img)
     for (int i = 0; i < h / 2 - kapa; i++)
         for (int j = 0; j < linesize; j = j + 3)
         {
-            matrix[i][j + 0] = matrix[i][j + 0] / 2 - 0;  // R
-            matrix[i][j + 1] = matrix[i][j + 1] / 2 - 55; // G
-            matrix[i][j + 2] = matrix[i][j + 2] / 2 - 0;  // B
+            matrix[i][j + 0] = clamp_u8(matrix[i][j + 0] / 2 - 0);  // R
+            matrix[i][j + 1] = clamp_u8(matrix[i][j + 1] / 2 - 55); // G
+            matrix[i][j + 2] = clamp_u8(matrix[i][j + 2] / 2 - 0);  // B
         }
 
     for (int i = h / 2 + kapa; i < h; i++)
         for (int j = 0; j < linesize; j = j + 3)
         {
-            matrix[i][j + 0] = matrix[i][j + 0] / 2 - 55; // R
-            matrix[i][j + 1] = matrix[i][j + 1] / 2 - 0;  // G
-            matrix[i][j + 2] = matrix[i][j + 2] / 2 - 0;  // B
+            matrix[i][j + 0] = clamp_u8(matrix[i][j + 0] / 2 - 55); // R
+            matrix[i][j + 1] = clamp_u8(matrix[i][j + 1] / 2 - 0);  // G
+            matrix[i][j + 2] = clamp_u8(matrix[i][j + 2] / 2 - 0);  // B
         }
     free(matrix);
 }
@@ -111,37 +126,87 @@ int main(int argc, char *argv[])
     AVCodecContext *pCodecCtx = NULL;   /* Contexto do codec de vídeo */
     AVFrame *pFrame = NULL,
             *pFrameRGB = NULL; /* Frames original e convertido para RGB */
-    AVPacket packet;           /* Pacote de dados lido do vídeo */
+    AVPacket *packet = NULL;   /* Pacote de dados lido do vídeo */
     struct SwsContext *sws_ctx = NULL; /* Contexto de conversão de cor */
+    int ret = -1; /* código de saída, ajustado para 0 só no final feliz */
 
     /* Abre o arquivo de vídeo */
-    avformat_open_input(&pFormatCtx, argv[1], NULL, NULL);
-    avformat_find_stream_info(pFormatCtx,
-                              NULL); /* Lê as informações do arquivo */
+    if (avformat_open_input(&pFormatCtx, argv[1], NULL, NULL) < 0)
+    {
+        fprintf(stderr, "Não foi possível abrir '%s'\n", argv[1]);
+        return -1;
+    }
+
+    if (avformat_find_stream_info(pFormatCtx, NULL) < 0)
+    {
+        fprintf(stderr, "Não foi possível ler as informações do arquivo\n");
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
 
     int videoStream = -1;
-    /* Procura o índice do stream de vídeo no arquivo */
-    for (int i = 0; i < pFormatCtx->nb_streams; i++)
+    /* Procura o índice do PRIMEIRO stream de vídeo no arquivo */
+    for (unsigned int i = 0; i < pFormatCtx->nb_streams; i++)
         if (pFormatCtx->streams[i]->codecpar->codec_type ==
             AVMEDIA_TYPE_VIDEO)
-            videoStream = i;
+        {
+            videoStream = (int)i;
+            break;
+        }
 
     if (videoStream == -1)
+    {
+        fprintf(stderr, "Nenhum stream de vídeo encontrado\n");
+        avformat_close_input(&pFormatCtx);
         return -1; /* Se nenhum stream de vídeo for encontrado, encerra o
                       programa */
+    }
 
     /* Encontra o decodificador apropriado */
     const AVCodec *pCodec = avcodec_find_decoder(
         pFormatCtx->streams[videoStream]->codecpar->codec_id);
+    if (!pCodec)
+    {
+        fprintf(stderr, "Decodificador não encontrado para este codec\n");
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
 
     /* Inicializa o contexto do codec e copia os parâmetros do stream */
     pCodecCtx = avcodec_alloc_context3(pCodec);
-    avcodec_parameters_to_context(pCodecCtx,
-                                  pFormatCtx->streams[videoStream]->codecpar);
-    avcodec_open2(pCodecCtx, pCodec, NULL); /* Abre o codec */
+    if (!pCodecCtx)
+    {
+        fprintf(stderr, "Não foi possível alocar o contexto do codec\n");
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
+    if (avcodec_parameters_to_context(
+            pCodecCtx, pFormatCtx->streams[videoStream]->codecpar) < 0)
+    {
+        fprintf(stderr, "Não foi possível configurar o contexto do codec\n");
+        avcodec_free_context(&pCodecCtx);
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
+    if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0) /* Abre o codec */
+    {
+        fprintf(stderr, "Não foi possível abrir o codec\n");
+        avcodec_free_context(&pCodecCtx);
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
 
     pFrame = av_frame_alloc();    /* Aloca estrutura para frame original */
     pFrameRGB = av_frame_alloc(); /* Aloca estrutura para frame convertido */
+    if (!pFrame || !pFrameRGB)
+    {
+        fprintf(stderr, "Não foi possível alocar os frames\n");
+        av_frame_free(&pFrame);
+        av_frame_free(&pFrameRGB);
+        avcodec_free_context(&pCodecCtx);
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
 
     int largura = pCodecCtx->width;
     int altura = pCodecCtx->height;
@@ -161,13 +226,40 @@ int main(int argc, char *argv[])
     if (numBytes < 0)
     {
         fprintf(stderr, "Erro ao alocar imagem RGB\n");
-        exit(1);
+        av_frame_free(&pFrame);
+        av_frame_free(&pFrameRGB);
+        avcodec_free_context(&pCodecCtx);
+        avformat_close_input(&pFormatCtx);
+        return -1;
     }
 
     /* Inicializa o contexto de conversão de cores (de YUV para RGB) */
     sws_ctx =
         sws_getContext(largura, altura, pCodecCtx->pix_fmt, largura, altura,
                        AV_PIX_FMT_RGB24, SWS_BILINEAR, NULL, NULL, NULL);
+    if (!sws_ctx)
+    {
+        fprintf(stderr, "Não foi possível criar o contexto de conversão\n");
+        av_freep(&pFrameRGB->data[0]);
+        av_frame_free(&pFrame);
+        av_frame_free(&pFrameRGB);
+        avcodec_free_context(&pCodecCtx);
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
+
+    packet = av_packet_alloc();
+    if (!packet)
+    {
+        fprintf(stderr, "Não foi possível alocar o pacote\n");
+        sws_freeContext(sws_ctx);
+        av_freep(&pFrameRGB->data[0]);
+        av_frame_free(&pFrame);
+        av_frame_free(&pFrameRGB);
+        avcodec_free_context(&pCodecCtx);
+        avformat_close_input(&pFormatCtx);
+        return -1;
+    }
 
     List frame_pool;         /* Pool de frame_ids disponíveis */
     List imagens_em_memoria; /* Lista de imagens capturadas na memória */
@@ -189,19 +281,20 @@ int main(int argc, char *argv[])
     }
 
     int intervalo =
-        total_frames / NUMBER_OF_FRAMES; /* Define espaçamento para capturar
-                                            NUMBER_OF_FRAMES amostras */
+        (int)(total_frames /
+              NUMBER_OF_FRAMES); /* Define espaçamento para capturar
+                                    NUMBER_OF_FRAMES amostras */
     if (intervalo < 1)
         intervalo = 1; /* Garante intervalo mínimo válido */
 
     int frame_count = 0;
     /* Loop de leitura do vídeo frame a frame */
-    while (av_read_frame(pFormatCtx, &packet) >= 0)
+    while (av_read_frame(pFormatCtx, packet) >= 0)
     {
-        if (packet.stream_index == videoStream)
+        if (packet->stream_index == videoStream)
         {
-            avcodec_send_packet(pCodecCtx, &packet);
-            if (avcodec_receive_frame(pCodecCtx, pFrame) == 0)
+            if (avcodec_send_packet(pCodecCtx, packet) == 0 &&
+                avcodec_receive_frame(pCodecCtx, pFrame) == 0)
             {
                 /* Salva o frame somente se for múltiplo do intervalo */
                 if (frame_count % intervalo == 0)
@@ -224,7 +317,7 @@ int main(int argc, char *argv[])
                         img->id = id;
                         img->largura = largura;
                         img->altura = altura;
-                        img->dados = malloc(largura * altura * 3);
+                        img->dados = malloc((size_t)largura * altura * 3);
 
                         printf("load[%d] (%d, %d)\n", img->id, img->largura,
                                img->altura);
@@ -233,10 +326,10 @@ int main(int argc, char *argv[])
                          * buffer da imagem */
                         for (int y = 0; y < altura; y++)
                         {
-                            memcpy(img->dados + y * largura * 3,
+                            memcpy(img->dados + (size_t)y * largura * 3,
                                    pFrameRGB->data[0] +
-                                       y * pFrameRGB->linesize[0],
-                                   largura * 3);
+                                       (size_t)y * pFrameRGB->linesize[0],
+                                   (size_t)largura * 3);
                         }
 
                         list_ins_next(&imagens_em_memoria, NULL,
@@ -246,7 +339,7 @@ int main(int argc, char *argv[])
                 frame_count++;
             }
         }
-        av_packet_unref(&packet); /* Libera recursos do pacote */
+        av_packet_unref(packet); /* Libera recursos do pacote */
     }
 
     printf("%s\n", "--------------------------");
@@ -275,6 +368,7 @@ int main(int argc, char *argv[])
     list_destroy(&imagens_em_memoria);
     list_destroy(&frame_pool);
 
+    av_packet_free(&packet);
     av_freep(
         &pFrameRGB->data[0]); // 🔥 OBRIGATÓRIO quando se usa av_image_alloc
     av_frame_free(&pFrame);
@@ -283,5 +377,6 @@ int main(int argc, char *argv[])
     avformat_close_input(&pFormatCtx);
     sws_freeContext(sws_ctx); /* Libera contexto de conversão */
 
-    return 0;
+    ret = 0;
+    return ret;
 }
