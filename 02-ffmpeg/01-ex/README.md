@@ -1,81 +1,20 @@
-Ivan, agora **o vazamento de memória desapareceu** (✅), **mas o erro de escrita inválida ainda persiste**:
+**`extract_frames.c`** extrai amostras de frames de um vídeo e salva cada uma como imagem `.ppm`, com um retângulo decorativo desenhado por cima.
 
-```
-== Invalid write of size 8
-== Address 0x10e9f692 is 1,218,898 bytes inside a block of size 1,218,901 alloc'd
-== ... in sws_scale()
-```
+**Uso:** `./extract_frames video.mp4`
 
-Você está usando corretamente `av_image_alloc()` — **mas o `sws_scale()` ainda está escrevendo 8 bytes além** do último byte “seguro”.
+**Passo a passo:**
 
----
+1. Abre o vídeo e encontra o primeiro stream de vídeo dentro dele.
+2. Abre o decodificador correspondente ao codec desse stream (H.264, etc).
+3. Calcula quantos frames o vídeo tem no total (usa `nb_frames` do container, ou estima por `duração × fps` se o container não informar isso).
+4. Divide esse total por `NUMBER_OF_FRAMES` (5) para descobrir de quantos em quantos frames deve capturar uma amostra — por exemplo, num vídeo de 500 frames, captura 1 a cada 100.
+5. Percorre o vídeo frame a frame decodificando. Sempre que o índice do frame bate com o intervalo calculado:
+   - Converte o frame decodificado (formato nativo do codec, geralmente YUV) para RGB24 via `sws_scale`.
+   - Copia esses dados RGB para uma estrutura `ImagemRGB` própria, guardada em uma lista em memória.
+6. Depois de ler o vídeo inteiro, para cada imagem guardada:
+   - Desenha um retângulo escurecido/colorido no meio da imagem (`draw_rectangle` — pinta metade de cima puxando pro verde, metade de baixo puxando pro vermelho, deixando uma faixa sem pintar no centro).
+   - Salva como `imagem_000.ppm`, `imagem_001.ppm`, etc.
 
-## ✅ Solução 100% funcional: **alocar com margem extra manualmente**
+**Sobre o "pool de frames":** o `frame_pool`/`frames.h` é um controle próprio de IDs (0 a 4) usando uma lista encadeada — funciona como um limitador que garante no máximo `NUMBER_OF_FRAMES` (5) imagens guardadas em memória ao mesmo tempo, mesmo que o cálculo de intervalo selecione mais que isso por algum motivo. Cada imagem recebe um ID desse pool e, ao ser salva no final, o ID volta pro pool (embora nesse fluxo específico o pool nunca seja reaproveitado durante a execução, já que tudo é salvo só no final).
 
-Apesar de `av_image_alloc()` ser a forma **correta e segura na maioria dos casos**, o erro que persiste é um bug conhecido (ou limitação) do `sws_scale()` com:
-
-* certas **larguras ímpares**,
-* ou **formatos RGB com linha mal alinhada**.
-
----
-
-## 💡 Solução prática recomendada:
-
-Use `av_image_alloc()` com uma **largura alinhada manualmente** (ex: múltiplo de 16).
-
-### 🔁 Substitua:
-
-```c
-int numBytes = av_image_alloc(pFrameRGB->data, pFrameRGB->linesize,
-                              largura, altura, AV_PIX_FMT_RGB24, 1);
-```
-
-### ✅ Por:
-
-```c
-// arredonda largura para múltiplo de 16
-int largura_alinhada = (largura + 15) & ~15;
-
-int numBytes = av_image_alloc(pFrameRGB->data, pFrameRGB->linesize,
-                              largura_alinhada, altura, AV_PIX_FMT_RGB24, 1);
-```
-
-Mas atenção: para isso funcionar, **você ainda usa `largura` original nas suas cópias**, não o `largura_alinhada`.
-
----
-
-### 📌 Alternativa mais segura e precisa (recomendada pelo próprio FFmpeg):
-
-Use `av_mallocz()` com **padding adicional** manual e evite `av_image_alloc`.
-
-```c
-int linesize = largura * 3;
-int padding = 32; // margem de segurança
-
-uint8_t *rgb_data = av_mallocz(linesize * altura + padding);
-
-// Preenche manualmente os ponteiros de pFrameRGB
-pFrameRGB->data[0] = rgb_data;
-pFrameRGB->linesize[0] = linesize;
-```
-
-Depois, libere com:
-
-```c
-av_free(rgb_data);
-```
-
----
-
-## ✅ Melhor caminho agora
-
-Como você já testou `av_image_alloc()` e ainda há `invalid write`, o mais robusto é:
-
-### ✔️ **Usar `av_mallocz()` com margem extra manual**
-
-Isso elimina o bug do `sws_scale()` com alinhamento e resolve o problema **de uma vez por todas**.
-
----
-
-Deseja que eu te envie o trecho completo atualizado usando `av_mallocz()` com esse ajuste?
-
+**Resultado prático:** rodando com um vídeo, você fica com até 5 arquivos `.ppm` (`imagem_000.ppm` a `imagem_004.ppm`), cada um sendo um frame do vídeo espaçado ao longo da duração total, com uma faixa colorida sobreposta no centro da imagem.
