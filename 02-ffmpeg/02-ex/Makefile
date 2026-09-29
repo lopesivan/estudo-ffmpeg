@@ -1,7 +1,7 @@
 
 SCRIPRS = ./waves.txt
 OUTPUT  = output.mp4
-NFRAMES = 30
+NFRAMES = 200
 
 FFMPEG_OPT = \
 			 -f lavfi \
@@ -13,7 +13,7 @@ $(OUTPUT):
 	ffmpeg $(FFMPEG_OPT) $(OUTPUT)
 
 play:
-	ffplay $(OUTPUT)
+	ffplay -loop 30 $(OUTPUT)
 
 clean:
 	rm $(OUTPUT)
