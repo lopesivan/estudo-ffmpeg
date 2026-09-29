@@ -1,36 +1,25 @@
-# Define o arquivo Makefile principal a ser incluído
-MAKEFILE := frames.mak
+.PHONY: configure build run clean
 
-# Obtém o diretório raiz do repositório Git
-GIT_ROOT := $(shell git rev-parse --show-toplevel)
+configure:
+	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
+		cmake -S . -B build -G Ninja \
+  			-DCMAKE_BUILD_TYPE=Release \
+  			-DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
-# Define o comando base para execução
-MAKE_CMD = ALGOWC_TOPDIR=$(GIT_ROOT) $(MAKE) -f $(MAKEFILE)
+build:
+	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
+		cmake --build build -j"$(nproc)"
 
-# Declara os targets que não correspondem a arquivos
-.PHONY: all clean
+run: build/video-app
+	./build/video-app
 
-# Target principal que será executado por padrão
-all:
-	$(MAKE_CMD)
-
-# Target para rodar programa
-run:
-	$(MAKE_CMD) $@
-
-# testa memória do programa
-free:
-	$(MAKE_CMD) $@
-
-# número de frames de vídeo do arquivo de vídeo
-frames:
-	$(MAKE_CMD) $@
-
-show:
-	eog imagem_000.ppm
-
-# Target para limpeza dos arquivos gerados
 clean:
-	$(MAKE_CMD) clean
-	rm *.png
+	rm -rf build output.mp4
+
+play: output.mp4
+	ffplay output.mp4
+
+info:output.mp4
+	ffprobe output.mp4
+
 
