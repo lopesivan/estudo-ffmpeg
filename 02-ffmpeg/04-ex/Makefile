@@ -30,6 +30,7 @@ frames:
 	$(MAKE_CMD) $@
 
 show:
+	# use espaco para avanca e backspace para retroceder
 	sxiv webcam_frame_*.png
 
 ls:
