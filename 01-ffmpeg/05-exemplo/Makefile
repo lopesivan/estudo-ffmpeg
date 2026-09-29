@@ -19,6 +19,9 @@ $(TARGET): $(SRC)
 run: main
 	./main
 
+play: output.mp4
+	ffplay output.mp4
+
 clean:
 	rm -f $(TARGET) $(TARGET).o output.mp4
 # END OF FILE
