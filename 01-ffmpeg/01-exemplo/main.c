@@ -70,7 +70,7 @@ int main()
     LOG("stream info obtida: %d streams", formatCtx->nb_streams);
 
     // Procura o fluxo de vídeo
-    for (int i = 0; i < formatCtx->nb_streams; i++)
+    for (unsigned int i = 0; i < formatCtx->nb_streams; i++)
     {
         LOG("stream[%d] codec_type=%d", i,
             formatCtx->streams[i]->codecpar->codec_type);
