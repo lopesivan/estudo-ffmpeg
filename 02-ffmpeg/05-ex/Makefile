@@ -10,8 +10,8 @@ build:
 	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
 		cmake --build build -j"$(nproc)"
 
-run: build/video_frames arquivo.mp4
-	./build/video_frames arquivo.mp4 10
+run: build/nain
+	./build/main
 
 clean:
 	rm -rf build *.png
