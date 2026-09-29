@@ -20,7 +20,7 @@
 
 #define DEVICE_PATH "/dev/video0"
 #define OUTPUT_FILENAME "output.mp4"
-#define OVERLAY_PNG "mira.png" /* gerado por ./gerar_mira.sh */
+#define OVERLAY_PNG "miras/mira-drone.png" /* gerado por ./gerar_mira.sh */
 #define FRAME_RATE 30
 #define DURATION 10
 #define CAPTURE_W 640
