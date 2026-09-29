@@ -7,12 +7,19 @@ configure:
   			-DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 build:
+	./mira.sh
 	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
 		cmake --build build -j"$(nproc)"
 
-run: build/nain
-	./build/main
+run: build/app
+	./build/app
 
 clean:
-	rm -rf build *.png
+	rm -rf build *.png output.mp4
+
+play: output.mp4
+	ffplay output.mp4
+
+info: output.mp4
+	ffprobe output.mp4
 
