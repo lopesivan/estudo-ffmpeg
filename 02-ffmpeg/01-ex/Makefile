@@ -1,36 +1,46 @@
-# Define o arquivo Makefile principal a ser incluído
-MAKEFILE := frames.mak
+# ============================================================
+# Configurações
+# ============================================================
+BUILD_DIR       := build
+CONAN_BUILD_DIR := build
+BUILD_TYPE      := Release
+PKG_CONFIG_PATH := /usr/lib/x86_64-linux-gnu/pkgconfig
+CONAN_TOOLCHAIN := $(CONAN_BUILD_DIR)/generators/conan_toolchain.cmake
 
-# Obtém o diretório raiz do repositório Git
-GIT_ROOT := $(shell git rev-parse --show-toplevel)
+.PHONY: all init config configure build run clean play info
 
-# Define o comando base para execução
-MAKE_CMD = ALGOWC_TOPDIR=$(GIT_ROOT) $(MAKE) -f $(MAKEFILE)
+all: build
 
-# Declara os targets que não correspondem a arquivos
-.PHONY: all clean
+init:
+	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
+	conan install . \
+		--output-folder=$(CONAN_BUILD_DIR) \
+		--build=missing \
+		-s build_type=$(BUILD_TYPE)
 
-# Target principal que será executado por padrão
-all:
-	$(MAKE_CMD)
+configure:
+	@if [ ! -f "$(CONAN_TOOLCHAIN)" ]; then \
+		echo "Toolchain do Conan não encontrado. Execute 'make init' primeiro."; \
+		exit 1; \
+	fi
+	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
+	cmake -S . -B $(CONAN_BUILD_DIR) -G Ninja \
+		-DCMAKE_TOOLCHAIN_FILE=$(CONAN_TOOLCHAIN) \
+		-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
+		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-# Target para rodar programa
-run:
-	$(MAKE_CMD) $@
+build:
+	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
+	cmake --build $(CONAN_BUILD_DIR) -j"$$(nproc)"
 
-# testa memória do programa
-free:
-	$(MAKE_CMD) $@
+run: $(CONAN_BUILD_DIR)/video-app
+	./$(CONAN_BUILD_DIR)/video-app
 
-# número de frames de vídeo do arquivo de vídeo
-frames:
-	$(MAKE_CMD) $@
-
-show:
-	eog imagem_000.ppm
-
-# Target para limpeza dos arquivos gerados
 clean:
-	$(MAKE_CMD) clean
-	rm imagem*.ppm
+	rm -rf $(CONAN_BUILD_DIR) output.mp4
 
+play: output.mp4
+	ffplay output.mp4
+
+info: output.mp4
+	ffprobe output.mp4
