@@ -1,382 +1,566 @@
-#include <libavcodec/avcodec.h> /* Biblioteca para lidar com codecs de vídeo/áudio */
-#include <libavformat/avformat.h> /* Biblioteca para manipular formatos de arquivo multimídia */
-#include <libavutil/imgutils.h> /* Funções auxiliares para imagens */
-#include <libswscale/swscale.h> /* Biblioteca para converter formatos de pixel e redimensionamento */
-
-#include "frames.h" /* Biblioteca personalizada para gerenciar IDs de frame */
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/videodev2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-#define NUMBER_OF_FRAMES 5
+#include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libavutil/time.h>
+#include <libswscale/swscale.h>
 
-/* Estrutura que representa uma imagem RGB mantida em memória */
-typedef struct
-{
-    int id;         /* Identificador lógico do frame */
-    int largura;    /* Largura da imagem em pixels */
-    int altura;     /* Altura da imagem em pixels */
-    uint8_t *dados; /* Ponteiro para os dados RGB (tamanho: largura * altura *
-                       3) */
-} ImagemRGB;
+#define DEVICE_PATH "/dev/video0"
+#define OUTPUT_FILENAME "output.mp4"
+#define OVERLAY_PNG "mira.png" /* gerado por ./gerar_mira.sh */
+#define FRAME_RATE 30
+#define DURATION 10
+#define CAPTURE_W 640
+#define CAPTURE_H 480
+#define NUM_BUFFERS 4
 
-/* Inicializa o pool de frame_ids usando uma lista encadeada (list.c).
- * Isso simula uma "fila de recursos" disponíveis para controlar alocação.
+typedef struct {
+  void *start;
+  size_t length;
+} MappedBuffer;
+
+/* Estado do grafo de filtros: uma entrada (frame da câmera) -> overlay da
+ * mira (carregada do PNG estático) -> uma saída (frame já composto). */
+typedef struct {
+  AVFilterGraph *graph;
+  AVFilterContext *buffersrc_ctx;
+  AVFilterContext *buffersink_ctx;
+} FilterState;
+
+/* Monta o grafo:
+ *   buffer (in) --------------------\
+ *                                    overlay -> format=yuv420p -> buffersink
+ *   movie=mira.png,format=rgba (wm) /
+ *
+ * O filtro "movie" abre o PNG usando o demuxer image2 + decoder png
+ * internos do FFmpeg, então não precisamos decodificar a mira à mão: o
+ * próprio libavfilter cuida disso, uma única vez, na configuração do grafo.
  */
-void init_frame_pool(List *pool, int total)
-{
-    /* Inicializa a lista e define 'free' como função
-                              de liberação dos dados */
-    list_init(pool, free);
-    for (int i = total - 1; i >= 0; i--)
-    {
-        int *f = malloc(sizeof(int)); /* Aloca um inteiro na heap */
-        *f = i;
-        /* Insere no início da lista (ordem reversa) */
-        list_ins_next(pool, NULL, f);
-    }
+static int init_overlay_filter(FilterState *fs, int width, int height,
+                               enum AVPixelFormat pix_fmt,
+                               AVRational time_base,
+                               const char *overlay_png_path) {
+  char args[512];
+  char filter_descr[512];
+  const AVFilter *buffersrc = avfilter_get_by_name("buffer");
+  const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+  AVFilterInOut *outputs = avfilter_inout_alloc();
+  AVFilterInOut *inputs = avfilter_inout_alloc();
+  enum AVPixelFormat pix_fmts[] = {AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE};
+  int ret = 0;
+
+  fs->graph = avfilter_graph_alloc();
+  if (!outputs || !inputs || !fs->graph) {
+    fprintf(stderr, "Erro ao alocar estruturas do filtro\n");
+    ret = AVERROR(ENOMEM);
+    goto end;
+  }
+
+  /* Parâmetros do frame que vamos empurrar para dentro do grafo (pad "in") */
+  snprintf(args, sizeof(args),
+           "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
+           width, height, pix_fmt, time_base.num, time_base.den);
+
+  ret = avfilter_graph_create_filter(&fs->buffersrc_ctx, buffersrc, "in",
+                                     args, NULL, fs->graph);
+  if (ret < 0) {
+    fprintf(stderr, "Erro ao criar o buffer source do filtro\n");
+    goto end;
+  }
+
+  ret = avfilter_graph_create_filter(&fs->buffersink_ctx, buffersink, "out",
+                                     NULL, NULL, fs->graph);
+  if (ret < 0) {
+    fprintf(stderr, "Erro ao criar o buffersink do filtro\n");
+    goto end;
+  }
+
+  ret = av_opt_set_int_list(fs->buffersink_ctx, "pix_fmts", pix_fmts,
+                            AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+  if (ret < 0) {
+    fprintf(stderr, "Erro ao configurar o formato de saída do filtro\n");
+    goto end;
+  }
+
+  /* Liga o pad de saída do nosso código ao pad "in" do grafo textual, e o
+   * pad "out" do grafo textual ao buffersink que vamos ler depois. */
+  outputs->name = av_strdup("in");
+  outputs->filter_ctx = fs->buffersrc_ctx;
+  outputs->pad_idx = 0;
+  outputs->next = NULL;
+
+  inputs->name = av_strdup("out");
+  inputs->filter_ctx = fs->buffersink_ctx;
+  inputs->pad_idx = 0;
+  inputs->next = NULL;
+
+  if (!outputs->name || !inputs->name) {
+    fprintf(stderr, "Erro ao alocar nomes dos pads do filtro\n");
+    ret = AVERROR(ENOMEM);
+    goto end;
+  }
+
+  /* format=rgba na mira garante que o canal alfa do PNG seja respeitado.
+   * format=yuv420p em [main] normaliza a entrada antes do overlay.
+   * overlay=(W-w)/2:(H-h)/2 centraliza a mira automaticamente, não importa
+   * o tamanho do PNG nem o tamanho do vídeo.
+   * format=yuv420p no final garante que o encoder H.264 receba o formato
+   * que ele espera. */
+  ret = snprintf(
+      filter_descr, sizeof(filter_descr),
+      "movie='%s',format=rgba[wm];"
+      "[in]format=yuv420p[main];"
+      "[main][wm]overlay=(W-w)/2:(H-h)/2:format=auto[ov];"
+      "[ov]format=yuv420p[out]",
+      overlay_png_path);
+  if (ret < 0 || (size_t)ret >= sizeof(filter_descr)) {
+    fprintf(stderr, "Caminho do PNG longo demais para o buffer do filtro\n");
+    ret = AVERROR(ENAMETOOLONG);
+    goto end;
+  }
+
+  ret = avfilter_graph_parse_ptr(fs->graph, filter_descr, &inputs, &outputs,
+                                 NULL);
+  if (ret < 0) {
+    fprintf(stderr,
+            "Erro ao interpretar o grafo de filtros (mira.png existe? "
+            "filtro 'movie' e decoder 'png' disponíveis?)\n");
+    goto end;
+  }
+
+  ret = avfilter_graph_config(fs->graph, NULL);
+  if (ret < 0) {
+    fprintf(stderr, "Erro ao configurar o grafo de filtros\n");
+    goto end;
+  }
+
+end:
+  avfilter_inout_free(&inputs);
+  avfilter_inout_free(&outputs);
+  return ret;
 }
 
-/* Salva uma imagem RGB em formato PPM (imagem bruta sem compressão) no disco
- */
-void salvar_imagem_em_arquivo(const ImagemRGB *img)
-{
-    char nome[64];
-    snprintf(nome, sizeof(nome), "imagem_%03d.ppm",
-             img->id); /* Gera nome do arquivo */
+int main(void) {
+  int ret = 0;
+  int fd = -1;
 
-    printf("save: imagem_%03d.ppm\n", img->id); /* Imprime nome do arquivo */
+  MappedBuffer buffers[NUM_BUFFERS];
+  memset(buffers, 0, sizeof(buffers));
 
-    FILE *f = fopen(nome, "wb");
-    if (!f)
-    {
-        fprintf(stderr, "Não foi possível criar %s\n", nome);
-        return;
+  AVFormatContext *ctx_out = NULL;
+  AVStream *stream = NULL;
+  const AVCodec *codec = NULL;
+  AVCodecContext *codec_ctx = NULL;
+  struct SwsContext *sws_ctx = NULL;
+  AVFrame *frame = NULL;      /* YUV420P antes do overlay */
+  AVFrame *filt_frame = NULL; /* YUV420P depois do overlay, pronto p/ encoder */
+  AVPacket *pkt = NULL;
+  FilterState filt = {0};
+
+  // =================================================================
+  // 1. Abre o dispositivo V4L2
+  // =================================================================
+  fd = open(DEVICE_PATH, O_RDWR | O_NONBLOCK);
+  if (fd == -1) {
+    fprintf(stderr, "Could not open device %s: %s\n", DEVICE_PATH,
+            strerror(errno));
+    return 1;
+  }
+
+  struct v4l2_capability cap;
+  if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
+    fprintf(stderr, "VIDIOC_QUERYCAP: %s\n", strerror(errno));
+    goto cleanup;
+  }
+
+  __u32 caps = cap.capabilities;
+  if (caps & V4L2_CAP_DEVICE_CAPS)
+    caps = cap.device_caps;
+
+  if (!(caps & V4L2_CAP_VIDEO_CAPTURE)) {
+    fprintf(stderr, "Device does not support video capture\n");
+    goto cleanup;
+  }
+  if (!(caps & V4L2_CAP_STREAMING)) {
+    fprintf(stderr, "Device does not support streaming\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 2. Formato YUYV 640x480
+  // =================================================================
+  struct v4l2_format fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.fmt.pix.width = CAPTURE_W;
+  fmt.fmt.pix.height = CAPTURE_H;
+  fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+  fmt.fmt.pix.field = V4L2_FIELD_NONE;
+
+  if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
+    fprintf(stderr, "VIDIOC_S_FMT: %s\n", strerror(errno));
+    goto cleanup;
+  }
+
+  fprintf(stderr, "Formato da câmera: %ux%u, fourcc=0x%08X\n",
+          fmt.fmt.pix.width, fmt.fmt.pix.height, fmt.fmt.pix.pixelformat);
+
+  if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
+    fprintf(stderr,
+            "Driver negociou formato diferente do pedido (esperado YUYV, "
+            "recebido fourcc=0x%08X)\n",
+            fmt.fmt.pix.pixelformat);
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 3. Framerate
+  // =================================================================
+  struct v4l2_streamparm parm;
+  memset(&parm, 0, sizeof(parm));
+  parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(fd, VIDIOC_G_PARM, &parm) == 0) {
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = FRAME_RATE;
+    ioctl(fd, VIDIOC_S_PARM, &parm);
+  }
+
+  // =================================================================
+  // 4. Pipeline V4L2: REQBUFS -> QUERYBUF -> mmap -> QBUF -> STREAMON
+  // =================================================================
+  struct v4l2_requestbuffers req;
+  memset(&req, 0, sizeof(req));
+  req.count = NUM_BUFFERS;
+  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  req.memory = V4L2_MEMORY_MMAP;
+
+  if (ioctl(fd, VIDIOC_REQBUFS, &req) == -1) {
+    fprintf(stderr, "VIDIOC_REQBUFS: %s\n", strerror(errno));
+    goto cleanup;
+  }
+  if (req.count < 2) {
+    fprintf(stderr, "Buffers insuficientes (%u)\n", req.count);
+    goto cleanup;
+  }
+  if (req.count > NUM_BUFFERS) {
+    fprintf(stderr,
+            "Driver alocou mais buffers (%u) do que o suportado (%d)\n",
+            req.count, NUM_BUFFERS);
+    goto cleanup;
+  }
+
+  for (unsigned i = 0; i < req.count; i++) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = i;
+
+    if (ioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) {
+      fprintf(stderr, "VIDIOC_QUERYBUF[%u]: %s\n", i, strerror(errno));
+      goto cleanup;
     }
-    fprintf(f, "P6\n%d %d\n255\n", img->largura,
-            img->altura); /* Cabeçalho do formato PPM */
 
-    /* Grava linha por linha os dados RGB */
-    for (int y = 0; y < img->altura; y++)
-    {
-        fwrite(img->dados + y * img->largura * 3, 1, img->largura * 3, f);
+    buffers[i].length = buf.length;
+    buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, fd, buf.m.offset);
+    if (buffers[i].start == MAP_FAILED) {
+      fprintf(stderr, "mmap[%u]: %s\n", i, strerror(errno));
+      buffers[i].start = NULL;
+      goto cleanup;
     }
-    fclose(f);
-}
+  }
 
-/* Satura um valor inteiro em [0, 255], evitando o "wrap" de uint8_t */
-static inline uint8_t clamp_u8(int v)
-{
-    if (v < 0)
-        return 0;
-    if (v > 255)
-        return 255;
-    return (uint8_t)v;
-}
+  for (unsigned i = 0; i < req.count; i++) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = i;
+    if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {
+      fprintf(stderr, "VIDIOC_QBUF[%u]: %s\n", i, strerror(errno));
+      goto cleanup;
+    }
+  }
 
-/* desenha um retangulo na imagem: */
-void draw_rectangle(ImagemRGB *img)
-{
-    printf("pintando pixel da imagem_%03d.ppm\n", img->id);
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(fd, VIDIOC_STREAMON, &type) == -1) {
+    fprintf(stderr, "VIDIOC_STREAMON: %s\n", strerror(errno));
+    goto cleanup;
+  }
 
-    int w = img->largura;
-    int h = img->altura;
-    int linesize = w * 3;
+  // =================================================================
+  // 5. Encoder H.264
+  // =================================================================
+  codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+  if (!codec) {
+    fprintf(stderr, "Could not find encoder H.264\n");
+    goto cleanup;
+  }
 
-    int kapa = 40;
+  codec_ctx = avcodec_alloc_context3(codec);
+  if (!codec_ctx) {
+    fprintf(stderr, "Could not allocate codec context\n");
+    goto cleanup;
+  }
 
-    // Aloca matriz de linhas
-    uint8_t **matrix = malloc(h * sizeof(uint8_t *));
-    if (!matrix)
-        return;
+  codec_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+  codec_ctx->codec_id = AV_CODEC_ID_H264;
+  codec_ctx->width = fmt.fmt.pix.width;
+  codec_ctx->height = fmt.fmt.pix.height;
+  codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+  codec_ctx->time_base = (AVRational){1, FRAME_RATE};
+  codec_ctx->framerate = (AVRational){FRAME_RATE, 1};
+  codec_ctx->bit_rate = 1000000;
+  codec_ctx->gop_size = 12;
+  codec_ctx->max_b_frames = 0;
+  codec_ctx->profile = AV_PROFILE_H264_HIGH;
+  codec_ctx->level = 40;
 
-    matrix[0] = &img->dados[0];
-    for (int i = 1; i < h; i++)
-        matrix[i] = matrix[i - 1] + linesize;
+  if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
+    fprintf(stderr, "Could not open encoder\n");
+    goto cleanup;
+  }
 
-    for (int i = 0; i < h / 2 - kapa; i++)
-        for (int j = 0; j < linesize; j = j + 3)
-        {
-            matrix[i][j + 0] = clamp_u8(matrix[i][j + 0] / 2 - 0);  // R
-            matrix[i][j + 1] = clamp_u8(matrix[i][j + 1] / 2 - 55); // G
-            matrix[i][j + 2] = clamp_u8(matrix[i][j + 2] / 2 - 0);  // B
+  // =================================================================
+  // 6. Contexto de saída MP4
+  // =================================================================
+  if (avformat_alloc_output_context2(&ctx_out, NULL, "mp4", OUTPUT_FILENAME) <
+          0 ||
+      !ctx_out) {
+    fprintf(stderr, "Could not allocate output context\n");
+    goto cleanup;
+  }
+
+  stream = avformat_new_stream(ctx_out, NULL);
+  if (!stream) {
+    fprintf(stderr, "Could not create video stream\n");
+    goto cleanup;
+  }
+
+  if (avcodec_parameters_from_context(stream->codecpar, codec_ctx) < 0) {
+    fprintf(stderr, "Could not copy codec parameters\n");
+    goto cleanup;
+  }
+  stream->time_base = codec_ctx->time_base;
+
+  if (!(ctx_out->oformat->flags & AVFMT_NOFILE)) {
+    if (avio_open(&ctx_out->pb, OUTPUT_FILENAME, AVIO_FLAG_WRITE) < 0) {
+      fprintf(stderr, "Could not open output file\n");
+      goto cleanup;
+    }
+  }
+
+  if (avformat_write_header(ctx_out, NULL) < 0) {
+    fprintf(stderr, "Could not write header\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 7. Frame YUV420P (pré-overlay) + sws_ctx + grafo de filtros
+  // =================================================================
+  frame = av_frame_alloc();
+  if (!frame) {
+    fprintf(stderr, "Could not allocate frame\n");
+    goto cleanup;
+  }
+  frame->format = codec_ctx->pix_fmt;
+  frame->width = codec_ctx->width;
+  frame->height = codec_ctx->height;
+  if (av_frame_get_buffer(frame, 32) < 0) {
+    fprintf(stderr, "Could not allocate frame buffer\n");
+    goto cleanup;
+  }
+
+  filt_frame = av_frame_alloc();
+  if (!filt_frame) {
+    fprintf(stderr, "Could not allocate filtered frame\n");
+    goto cleanup;
+  }
+
+  // YUYV (640x480) -> YUV420P (640x480)
+  sws_ctx =
+      sws_getContext(fmt.fmt.pix.width, fmt.fmt.pix.height, AV_PIX_FMT_YUYV422,
+                     codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                     SWS_BILINEAR, NULL, NULL, NULL);
+  if (!sws_ctx) {
+    fprintf(stderr, "Could not create sws context\n");
+    goto cleanup;
+  }
+
+  if (init_overlay_filter(&filt, codec_ctx->width, codec_ctx->height,
+                          codec_ctx->pix_fmt, codec_ctx->time_base,
+                          OVERLAY_PNG) < 0) {
+    fprintf(stderr, "Could not initialize overlay filter graph\n");
+    goto cleanup;
+  }
+
+  pkt = av_packet_alloc();
+  if (!pkt) {
+    fprintf(stderr, "Could not allocate packet\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 8. Loop principal: captura -> escala -> overlay -> encode -> grava
+  // =================================================================
+  int64_t start_time = av_gettime_relative();
+  int frame_count = 0;
+
+  uint8_t *src_slice[4] = {NULL, NULL, NULL, NULL};
+  int src_stride[4] = {0, 0, 0, 0};
+
+  while (1) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) {
+      if (errno == EAGAIN) {
+        usleep(1000);
+        continue;
+      }
+      fprintf(stderr, "VIDIOC_DQBUF: %s\n", strerror(errno));
+      break;
+    }
+
+    // -------- YUYV -> YUV420P --------
+    src_slice[0] = (uint8_t *)buffers[buf.index].start;
+    src_stride[0] = fmt.fmt.pix.width * 2; // YUYV = 2 bytes/pixel
+
+    if (av_frame_make_writable(frame) < 0) {
+      ioctl(fd, VIDIOC_QBUF, &buf);
+      break;
+    }
+
+    sws_scale(sws_ctx, (const uint8_t *const *)src_slice, src_stride, 0,
+              fmt.fmt.pix.height, frame->data, frame->linesize);
+
+    frame->pts = av_rescale_q(frame_count, (AVRational){1, FRAME_RATE},
+                              codec_ctx->time_base);
+
+    // Devolve o buffer mmapado ao driver assim que os dados já foram
+    // copiados pelo sws_scale — não precisamos mais dele.
+    if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {
+      fprintf(stderr, "VIDIOC_QBUF: %s\n", strerror(errno));
+      break;
+    }
+
+    // -------- Overlay da mira --------
+    // AV_BUFFERSRC_FLAG_KEEP_REF garante que 'frame' continue válido e
+    // reaproveitável na próxima iteração, mesmo depois de entregue ao grafo.
+    if (av_buffersrc_add_frame_flags(filt.buffersrc_ctx, frame,
+                                     AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
+      fprintf(stderr, "Erro ao enviar frame ao filtro\n");
+      break;
+    }
+
+    while (1) {
+      int fret = av_buffersink_get_frame(filt.buffersink_ctx, filt_frame);
+      if (fret == AVERROR(EAGAIN) || fret == AVERROR_EOF)
+        break;
+      if (fret < 0) {
+        fprintf(stderr, "Erro ao receber frame filtrado\n");
+        goto cleanup;
+      }
+
+      // -------- Encode --------
+      if (avcodec_send_frame(codec_ctx, filt_frame) < 0) {
+        fprintf(stderr, "Could not send frame\n");
+        av_frame_unref(filt_frame);
+        goto cleanup;
+      }
+      av_frame_unref(filt_frame);
+
+      while (1) {
+        ret = avcodec_receive_packet(codec_ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+          break;
+        if (ret < 0) {
+          fprintf(stderr, "Could not encode frame\n");
+          goto cleanup;
         }
 
-    for (int i = h / 2 + kapa; i < h; i++)
-        for (int j = 0; j < linesize; j = j + 3)
-        {
-            matrix[i][j + 0] = clamp_u8(matrix[i][j + 0] / 2 - 55); // R
-            matrix[i][j + 1] = clamp_u8(matrix[i][j + 1] / 2 - 0);  // G
-            matrix[i][j + 2] = clamp_u8(matrix[i][j + 2] / 2 - 0);  // B
+        pkt->stream_index = stream->index;
+        av_packet_rescale_ts(pkt, codec_ctx->time_base, stream->time_base);
+
+        if (av_interleaved_write_frame(ctx_out, pkt) < 0) {
+          fprintf(stderr, "Could not write packet\n");
+          av_packet_unref(pkt);
+          goto cleanup;
         }
-    free(matrix);
-}
+        av_packet_unref(pkt);
+      }
 
-/* Função principal do programa */
-int main(int argc, char *argv[])
-{
-    /* Verifica se o caminho do vídeo foi passado como argumento */
-    if (argc < 2)
-    {
-        printf("Uso: %s arquivo.mp4\n", argv[0]);
-        return -1;
+      frame_count++;
     }
 
-    AVFormatContext *pFormatCtx = NULL; /* Contexto do arquivo de mídia */
-    AVCodecContext *pCodecCtx = NULL;   /* Contexto do codec de vídeo */
-    AVFrame *pFrame = NULL,
-            *pFrameRGB = NULL; /* Frames original e convertido para RGB */
-    AVPacket *packet = NULL;   /* Pacote de dados lido do vídeo */
-    struct SwsContext *sws_ctx = NULL; /* Contexto de conversão de cor */
-    int ret = -1; /* código de saída, ajustado para 0 só no final feliz */
+    if ((av_gettime_relative() - start_time) / 1000000 >= DURATION)
+      break;
+  }
 
-    /* Abre o arquivo de vídeo */
-    if (avformat_open_input(&pFormatCtx, argv[1], NULL, NULL) < 0)
-    {
-        fprintf(stderr, "Não foi possível abrir '%s'\n", argv[1]);
-        return -1;
+  // =================================================================
+  // 9. Flush do encoder
+  // =================================================================
+  avcodec_send_frame(codec_ctx, NULL);
+  while (1) {
+    ret = avcodec_receive_packet(codec_ctx, pkt);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+      break;
+    if (ret < 0)
+      break;
+
+    pkt->stream_index = stream->index;
+    av_packet_rescale_ts(pkt, codec_ctx->time_base, stream->time_base);
+    av_interleaved_write_frame(ctx_out, pkt);
+    av_packet_unref(pkt);
+  }
+
+  av_write_trailer(ctx_out);
+  fprintf(stderr, "OK: %d frames gravados em %s\n", frame_count,
+          OUTPUT_FILENAME);
+  ret = 0;
+
+cleanup:
+  if (fd >= 0) {
+    enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(fd, VIDIOC_STREAMOFF, &t);
+
+    for (unsigned i = 0; i < NUM_BUFFERS; i++) {
+      if (buffers[i].start && buffers[i].start != MAP_FAILED)
+        munmap(buffers[i].start, buffers[i].length);
     }
+    close(fd);
+  }
 
-    if (avformat_find_stream_info(pFormatCtx, NULL) < 0)
-    {
-        fprintf(stderr, "Não foi possível ler as informações do arquivo\n");
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
+  if (filt.graph)
+    avfilter_graph_free(&filt.graph);
+  if (sws_ctx)
+    sws_freeContext(sws_ctx);
+  av_frame_free(&frame);
+  av_frame_free(&filt_frame);
+  av_packet_free(&pkt);
+  avcodec_free_context(&codec_ctx);
 
-    int videoStream = -1;
-    /* Procura o índice do PRIMEIRO stream de vídeo no arquivo */
-    for (unsigned int i = 0; i < pFormatCtx->nb_streams; i++)
-        if (pFormatCtx->streams[i]->codecpar->codec_type ==
-            AVMEDIA_TYPE_VIDEO)
-        {
-            videoStream = (int)i;
-            break;
-        }
+  if (ctx_out) {
+    if (ctx_out->pb)
+      avio_closep(&ctx_out->pb);
+    avformat_free_context(ctx_out);
+  }
 
-    if (videoStream == -1)
-    {
-        fprintf(stderr, "Nenhum stream de vídeo encontrado\n");
-        avformat_close_input(&pFormatCtx);
-        return -1; /* Se nenhum stream de vídeo for encontrado, encerra o
-                      programa */
-    }
-
-    /* Encontra o decodificador apropriado */
-    const AVCodec *pCodec = avcodec_find_decoder(
-        pFormatCtx->streams[videoStream]->codecpar->codec_id);
-    if (!pCodec)
-    {
-        fprintf(stderr, "Decodificador não encontrado para este codec\n");
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-
-    /* Inicializa o contexto do codec e copia os parâmetros do stream */
-    pCodecCtx = avcodec_alloc_context3(pCodec);
-    if (!pCodecCtx)
-    {
-        fprintf(stderr, "Não foi possível alocar o contexto do codec\n");
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-    if (avcodec_parameters_to_context(
-            pCodecCtx, pFormatCtx->streams[videoStream]->codecpar) < 0)
-    {
-        fprintf(stderr, "Não foi possível configurar o contexto do codec\n");
-        avcodec_free_context(&pCodecCtx);
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-    if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0) /* Abre o codec */
-    {
-        fprintf(stderr, "Não foi possível abrir o codec\n");
-        avcodec_free_context(&pCodecCtx);
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-
-    pFrame = av_frame_alloc();    /* Aloca estrutura para frame original */
-    pFrameRGB = av_frame_alloc(); /* Aloca estrutura para frame convertido */
-    if (!pFrame || !pFrameRGB)
-    {
-        fprintf(stderr, "Não foi possível alocar os frames\n");
-        av_frame_free(&pFrame);
-        av_frame_free(&pFrameRGB);
-        avcodec_free_context(&pCodecCtx);
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-
-    int largura = pCodecCtx->width;
-    int altura = pCodecCtx->height;
-
-    printf("imagem: (%d, %d)\n", largura, altura);
-
-    // arredonda largura para múltiplo de 16
-    int largura_alinhada = (largura + 15) & ~15;
-
-    int numBytes =
-        av_image_alloc(pFrameRGB->data, pFrameRGB->linesize, largura_alinhada,
-                       altura, AV_PIX_FMT_RGB24, 1);
-
-    /* int numBytes = av_image_alloc(pFrameRGB->data, pFrameRGB->linesize, */
-    /* largura, altura, AV_PIX_FMT_RGB24, 1); */
-
-    if (numBytes < 0)
-    {
-        fprintf(stderr, "Erro ao alocar imagem RGB\n");
-        av_frame_free(&pFrame);
-        av_frame_free(&pFrameRGB);
-        avcodec_free_context(&pCodecCtx);
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-
-    /* Inicializa o contexto de conversão de cores (de YUV para RGB) */
-    sws_ctx =
-        sws_getContext(largura, altura, pCodecCtx->pix_fmt, largura, altura,
-                       AV_PIX_FMT_RGB24, SWS_BILINEAR, NULL, NULL, NULL);
-    if (!sws_ctx)
-    {
-        fprintf(stderr, "Não foi possível criar o contexto de conversão\n");
-        av_freep(&pFrameRGB->data[0]);
-        av_frame_free(&pFrame);
-        av_frame_free(&pFrameRGB);
-        avcodec_free_context(&pCodecCtx);
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-
-    packet = av_packet_alloc();
-    if (!packet)
-    {
-        fprintf(stderr, "Não foi possível alocar o pacote\n");
-        sws_freeContext(sws_ctx);
-        av_freep(&pFrameRGB->data[0]);
-        av_frame_free(&pFrame);
-        av_frame_free(&pFrameRGB);
-        avcodec_free_context(&pCodecCtx);
-        avformat_close_input(&pFormatCtx);
-        return -1;
-    }
-
-    List frame_pool;         /* Pool de frame_ids disponíveis */
-    List imagens_em_memoria; /* Lista de imagens capturadas na memória */
-    init_frame_pool(
-        &frame_pool,
-        NUMBER_OF_FRAMES); /* Cria pool com NUMBER_OF_FRAMES slots */
-    list_init(&imagens_em_memoria, free); /* Inicializa lista para armazenar
-                                             ponteiros de ImagemRGB */
-
-    /* Estima o número total de frames do vídeo */
-    int64_t total_frames = pFormatCtx->streams[videoStream]->nb_frames;
-    if (total_frames == 0)
-    {
-        double duration = pFormatCtx->duration / (double)AV_TIME_BASE;
-        AVRational framerate = pFormatCtx->streams[videoStream]->r_frame_rate;
-        total_frames =
-            (int64_t)(duration *
-                      av_q2d(framerate)); /* fallback: duração * FPS */
-    }
-
-    int intervalo =
-        (int)(total_frames /
-              NUMBER_OF_FRAMES); /* Define espaçamento para capturar
-                                    NUMBER_OF_FRAMES amostras */
-    if (intervalo < 1)
-        intervalo = 1; /* Garante intervalo mínimo válido */
-
-    int frame_count = 0;
-    /* Loop de leitura do vídeo frame a frame */
-    while (av_read_frame(pFormatCtx, packet) >= 0)
-    {
-        if (packet->stream_index == videoStream)
-        {
-            if (avcodec_send_packet(pCodecCtx, packet) == 0 &&
-                avcodec_receive_frame(pCodecCtx, pFrame) == 0)
-            {
-                /* Salva o frame somente se for múltiplo do intervalo */
-                if (frame_count % intervalo == 0)
-                {
-
-                    int id = alloc_frame(
-                        &frame_pool); /* Aloca um frame_id disponível */
-                    if (id != -1)
-                    {
-                        printf("frame: %d\n", frame_count);
-
-                        /* Converte frame original para RGB */
-                        sws_scale(sws_ctx,
-                                  (uint8_t const *const *)pFrame->data,
-                                  pFrame->linesize, 0, altura,
-                                  pFrameRGB->data, pFrameRGB->linesize);
-
-                        /* Cria e preenche estrutura de imagem RGB */
-                        ImagemRGB *img = malloc(sizeof(ImagemRGB));
-                        img->id = id;
-                        img->largura = largura;
-                        img->altura = altura;
-                        img->dados = malloc((size_t)largura * altura * 3);
-
-                        printf("load[%d] (%d, %d)\n", img->id, img->largura,
-                               img->altura);
-
-                        /* Copia os dados RGB do frame convertido para o
-                         * buffer da imagem */
-                        for (int y = 0; y < altura; y++)
-                        {
-                            memcpy(img->dados + (size_t)y * largura * 3,
-                                   pFrameRGB->data[0] +
-                                       (size_t)y * pFrameRGB->linesize[0],
-                                   (size_t)largura * 3);
-                        }
-
-                        list_ins_next(&imagens_em_memoria, NULL,
-                                      img); /* Insere na lista */
-                    }
-                }
-                frame_count++;
-            }
-        }
-        av_packet_unref(packet); /* Libera recursos do pacote */
-    }
-
-    printf("%s\n", "--------------------------");
-
-    /* Após o loop: salva cada imagem armazenada em memória */
-    ListElmt *elmt = list_head(&imagens_em_memoria);
-    while (elmt != NULL)
-    {
-        ImagemRGB *img = (ImagemRGB *)list_data(elmt);
-
-        printf("memory id[%d] (%d, %d)\n", img->id, img->largura,
-               img->altura);
-
-        draw_rectangle(img);
-        salvar_imagem_em_arquivo(img); /* Salva imagem .ppm */
-
-        free(img->dados); /* Libera dados RGB */
-
-        /* Devolve o frame_id ao pool */
-        free_frame(&frame_pool, img->id);
-
-        elmt = list_next(elmt);
-    }
-
-    /* Liberação geral dos recursos */
-    list_destroy(&imagens_em_memoria);
-    list_destroy(&frame_pool);
-
-    av_packet_free(&packet);
-    av_freep(
-        &pFrameRGB->data[0]); // 🔥 OBRIGATÓRIO quando se usa av_image_alloc
-    av_frame_free(&pFrame);
-    av_frame_free(&pFrameRGB);
-    avcodec_free_context(&pCodecCtx);
-    avformat_close_input(&pFormatCtx);
-    sws_freeContext(sws_ctx); /* Libera contexto de conversão */
-
-    ret = 0;
-    return ret;
+  return ret;
 }
