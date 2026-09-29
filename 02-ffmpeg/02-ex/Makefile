@@ -12,6 +12,9 @@ FFMPEG_OPT = \
 $(OUTPUT):
 	ffmpeg $(FFMPEG_OPT) $(OUTPUT)
 
+play:
+	ffplay $(OUTPUT)
+
 clean:
 	rm $(OUTPUT)
 
