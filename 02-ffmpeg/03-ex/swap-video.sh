@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-uppdir=../../..
+uppdir=../..
 
 # Nome do link simbólico fixo
 SYMLINK="arquivo.mp4"
