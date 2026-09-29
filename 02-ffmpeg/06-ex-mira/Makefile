@@ -23,3 +23,16 @@ play: output.mp4
 info: output.mp4
 	ffprobe output.mp4
 
+
+MIRA_SCRIPT  := ./mira2.sh
+MIRA_DIR     := miras
+MIRA_SIZE    := 300
+MIRA_ESTILOS := classica sniper radar predador drone bussola scanner retro coruja xadrez
+
+.PHONY: miras
+
+miras:
+	mkdir -p $(MIRA_DIR)
+	for estilo in $(MIRA_ESTILOS); do \
+		$(MIRA_SCRIPT) "$$estilo" "$(MIRA_SIZE)" "$(MIRA_DIR)/mira-$$estilo.png"; \
+	done
