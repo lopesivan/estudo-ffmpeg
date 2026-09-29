@@ -38,6 +38,7 @@ list(APPEND SOURCES
     video_frames.c
     # Descomente os .c do algorithms_with_c conforme precisar:
     ${ALG_SRC}/list.c
+    ${ALG_SRC}/frames.c
     # ${ALG_SRC}/queue.c
     # ${ALG_SRC}/stack.c
 )
