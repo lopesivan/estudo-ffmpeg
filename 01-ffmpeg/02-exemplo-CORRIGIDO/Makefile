@@ -23,6 +23,12 @@ run:
 	cp ../01-exemplo/video.mp4 .
 	./main video.mp4 video.avi
 
+test:
+	ffmpeg -i video.mp4 2>&1 | grep -oP 'Duration: \K[0-9:.]+'
+	ffmpeg -i video.avi 2>&1 | grep -oP 'Duration: \K[0-9:.]+'
+	ffmpeg -i video.mp4 2>&1 | grep -oP 'Duration: \K[0-9:.]+' | awk -F: '{print ($$1*3600)+($$2*60)+$$3}'
+	ffmpeg -i video.avi 2>&1 | grep -oP 'Duration: \K[0-9:.]+' | awk -F: '{print ($$1*3600)+($$2*60)+$$3}'
+
 show: video.avi
 	ffplay video.avi
 
