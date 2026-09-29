@@ -1,46 +1,39 @@
-# ============================================================
-# Configurações
-# ============================================================
-BUILD_DIR       := build
-CONAN_BUILD_DIR := build
-BUILD_TYPE      := Release
-PKG_CONFIG_PATH := /usr/lib/x86_64-linux-gnu/pkgconfig
+BUILD_TYPE ?= Release
+BUILD_DIR := build
+CONAN_BUILD_DIR := $(BUILD_DIR)/$(BUILD_TYPE)
 CONAN_TOOLCHAIN := $(CONAN_BUILD_DIR)/generators/conan_toolchain.cmake
 
-.PHONY: all init config configure build run clean play info
+TARGET ?= video_frames
+JOBS ?= $(shell nproc)
+
+.PHONY: all init configure build run clean rebuild
 
 all: build
 
 init:
+	conan profile detect --force
 	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
 	conan install . \
-		--output-folder=$(CONAN_BUILD_DIR) \
 		--build=missing \
 		-s build_type=$(BUILD_TYPE)
 
-configure:
-	@if [ ! -f "$(CONAN_TOOLCHAIN)" ]; then \
-		echo "Toolchain do Conan não encontrado. Execute 'make init' primeiro."; \
-		exit 1; \
-	fi
+configure: init
 	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
-	cmake -S . -B $(CONAN_BUILD_DIR) -G Ninja \
-		-DCMAKE_TOOLCHAIN_FILE=$(CONAN_TOOLCHAIN) \
+	cmake \
+		-S . \
+		-B $(CONAN_BUILD_DIR) \
+		-G Ninja \
 		-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
-		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+		-DCMAKE_TOOLCHAIN_FILE=$(CONAN_TOOLCHAIN)
 
 build:
 	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
-	cmake --build $(CONAN_BUILD_DIR) -j"$$(nproc)"
+	cmake --build $(CONAN_BUILD_DIR) -j$(JOBS)
 
-run: $(CONAN_BUILD_DIR)/video-app
-	./$(CONAN_BUILD_DIR)/video-app
+run: $(CONAN_BUILD_DIR)/video-app arquivo.mp4
+	$(CONAN_BUILD_DIR)/video-app arquivo.mp4
 
 clean:
-	rm -rf $(CONAN_BUILD_DIR) output.mp4
+	rm -rf $(BUILD_DIR)
 
-play: output.mp4
-	ffplay output.mp4
-
-info: output.mp4
-	ffprobe output.mp4
+rebuild: clean build
