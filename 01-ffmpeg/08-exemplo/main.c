@@ -27,8 +27,8 @@
 // ============================================================
 // CONFIGURAÇÃO DA CRUZ GIRATÓRIA
 // ============================================================
-#define LINE_THICKNESS 4 // espessura da linha em pixels
-#define CROSS_COLOR_Y 76 // vermelho (BT.601)
+#define LINE_THICKNESS 10 // espessura da linha em pixels
+#define CROSS_COLOR_Y 76  // vermelho (BT.601)
 #define CROSS_COLOR_U 84
 #define CROSS_COLOR_V 255
 #define CROSS_ROTATION_SPEED 2.0 // graus por frame
