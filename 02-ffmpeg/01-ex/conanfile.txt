@@ -1,0 +1,9 @@
+[requires]
+algorithms_with_c/1.0.0@ivancarlos/stable
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
