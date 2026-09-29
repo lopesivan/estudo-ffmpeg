@@ -5,7 +5,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 int save_frame_as_png(AVFrame* frame, int width, int height, int frame_number)
 {
