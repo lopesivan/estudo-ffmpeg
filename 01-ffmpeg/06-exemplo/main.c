@@ -1,413 +1,382 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/opt.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/time.h>
+#include <string.h>
+#include <unistd.h>
 
+#include <libavcodec/avcodec.h>
+#include <libavdevice/avdevice.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/opt.h>
+#include <libavutil/time.h>
+#include <libswscale/swscale.h>
+
+#define VIDEO_DEVICE "/dev/video0"
 #define OUTPUT_H264_FILENAME "output.h264"
 #define OUTPUT_MP4_FILENAME "output.mp4"
+#define TARGET_DURATION_S 10
+#define FPS 25
+#define ENC_W 640
+#define ENC_H 480
 
-int main (int argc, char **argv)
-{
-    int ret;
-    AVFormatContext *pFormatCtx = NULL;
-    AVInputFormat *pInputFmt = NULL;
-    AVStream *pVideoStream = NULL;
-    AVCodecContext *pCodecCtx = NULL;
-    AVCodec *pCodec = NULL;
-    AVPacket packet;
-    AVFrame *pFrame = NULL;
-    int videoStreamIndex = -1;
-    int frameCount = 0;
-    int64_t start_time = 0;
-    int64_t end_time = 0;
-    int64_t duration = 0;
-    int64_t target_duration = 10000000; // 10 seconds in microseconds
-    int64_t last_pts = AV_NOPTS_VALUE;
-    int64_t next_pts = 0;
-    int64_t pts_diff = 0;
-    FILE *pH264File = NULL;
-    FILE *pMp4File = NULL;
-    AVOutputFormat *pOutputFmtH264 = NULL;
-    AVOutputFormat *pOutputFmtMP4 = NULL;
-    AVFormatContext *pFormatCtxH264 = NULL;
-    AVFormatContext *pFormatCtxMP4 = NULL;
-    AVStream *pStreamH264 = NULL;
-    AVStream *pStreamMP4 = NULL;
-    AVCodecContext *pCodecCtxH264 = NULL;
-    AVCodecContext *pCodecCtxMP4 = NULL;
-    AVCodec *pCodecH264 = NULL;
-    AVCodec *pCodecMP4 = NULL;
-    AVDictionary *opts = NULL;
+int main(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
 
-    // Register all formats and codecs
-    av_register_all();
+  int ret = 0;
 
-    // Open input file
-    if ((ret = avformat_open_input (&pFormatCtx, "/dev/video0", pInputFmt,
-                                    NULL)) < 0)
-    {
-        fprintf (stderr, "Could not open input file\n");
-        goto end;
+  // ---------- Entrada (câmera) ----------
+  AVFormatContext *in_ctx = NULL;
+  const AVInputFormat *in_fmt = NULL;
+  AVCodecContext *dec_ctx = NULL;
+  const AVCodec *decoder = NULL;
+  int video_idx = -1;
+
+  // ---------- Encoder (compartilhado) ----------
+  AVCodecContext *enc_ctx = NULL;
+  const AVCodec *encoder = NULL;
+  struct SwsContext *sws_ctx = NULL;
+  AVFrame *enc_frame = NULL; // YUV420P
+  AVFrame *dec_frame = NULL; // formato nativo da câmera
+  AVPacket *in_pkt = NULL;
+  AVPacket *out_pkt = NULL;
+
+  // ---------- Saídas ----------
+  AVFormatContext *out_ctx_h264 = NULL;
+  AVFormatContext *out_ctx_mp4 = NULL;
+  AVStream *st_h264 = NULL;
+  AVStream *st_mp4 = NULL;
+
+  int64_t start_time = 0;
+  int frame_count = 0;
+
+  // =================================================================
+  // 1. Entrada v4l2
+  // =================================================================
+  avdevice_register_all();
+  in_fmt = av_find_input_format("v4l2");
+  if (!in_fmt) {
+    fprintf(stderr, "Formato v4l2 indisponível.\n");
+    return -1;
+  }
+
+  AVDictionary *opts = NULL;
+  av_dict_set(&opts, "video_size", "640x480", 0);
+  av_dict_set(&opts, "framerate", "25", 0);
+
+  if (avformat_open_input(&in_ctx, VIDEO_DEVICE, in_fmt, &opts) < 0) {
+    fprintf(stderr, "Erro ao abrir %s\n", VIDEO_DEVICE);
+    av_dict_free(&opts);
+    return -1;
+  }
+  av_dict_free(&opts);
+
+  if (avformat_find_stream_info(in_ctx, NULL) < 0) {
+    fprintf(stderr, "Erro em avformat_find_stream_info\n");
+    goto cleanup;
+  }
+
+  for (unsigned i = 0; i < in_ctx->nb_streams; i++) {
+    if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+      video_idx = (int)i;
+      break;
+    }
+  }
+  if (video_idx < 0) {
+    fprintf(stderr, "Nenhum stream de vídeo na câmera.\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 2. Decoder da câmera
+  // =================================================================
+  AVCodecParameters *in_par = in_ctx->streams[video_idx]->codecpar;
+  decoder = avcodec_find_decoder(in_par->codec_id);
+  if (!decoder) {
+    fprintf(stderr, "Decoder não encontrado (codec_id=%d)\n", in_par->codec_id);
+    goto cleanup;
+  }
+
+  dec_ctx = avcodec_alloc_context3(decoder);
+  if (!dec_ctx)
+    goto cleanup;
+
+  if (avcodec_parameters_to_context(dec_ctx, in_par) < 0)
+    goto cleanup;
+  if (avcodec_open2(dec_ctx, decoder, NULL) < 0) {
+    fprintf(stderr, "Erro ao abrir decoder.\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 3. Encoder H.264 (uma única vez)
+  // =================================================================
+  encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+  if (!encoder) {
+    fprintf(stderr, "Encoder H.264 não encontrado.\n");
+    goto cleanup;
+  }
+
+  enc_ctx = avcodec_alloc_context3(encoder);
+  if (!enc_ctx)
+    goto cleanup;
+
+  enc_ctx->codec_id = AV_CODEC_ID_H264;
+  enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+  enc_ctx->width = ENC_W;
+  enc_ctx->height = ENC_H;
+  enc_ctx->time_base = (AVRational){1, FPS};
+  enc_ctx->framerate = (AVRational){FPS, 1};
+  enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+  enc_ctx->bit_rate = 400000;
+  enc_ctx->gop_size = 12;
+  enc_ctx->max_b_frames = 0;
+
+  if (avcodec_open2(enc_ctx, encoder, NULL) < 0) {
+    fprintf(stderr, "Erro ao abrir encoder H.264.\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 4. Saída MP4 (muxer com arquivo)
+  // =================================================================
+  if (avformat_alloc_output_context2(&out_ctx_mp4, NULL, "mp4",
+                                     OUTPUT_MP4_FILENAME) < 0 ||
+      !out_ctx_mp4) {
+    fprintf(stderr, "Erro ao criar contexto MP4.\n");
+    goto cleanup;
+  }
+
+  st_mp4 = avformat_new_stream(out_ctx_mp4, NULL);
+  if (!st_mp4)
+    goto cleanup;
+  if (avcodec_parameters_from_context(st_mp4->codecpar, enc_ctx) < 0)
+    goto cleanup;
+  st_mp4->time_base = enc_ctx->time_base;
+
+  if (!(out_ctx_mp4->oformat->flags & AVFMT_NOFILE)) {
+    if (avio_open(&out_ctx_mp4->pb, OUTPUT_MP4_FILENAME, AVIO_FLAG_WRITE) < 0) {
+      fprintf(stderr, "Erro ao abrir %s\n", OUTPUT_MP4_FILENAME);
+      goto cleanup;
+    }
+  }
+  if (avformat_write_header(out_ctx_mp4, NULL) < 0) {
+    fprintf(stderr, "Erro ao escrever header MP4.\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 5. Saída H.264 raw (muxer sem arquivo — o formato h264 não é
+  //    muxável por AVFormatContext; usamos o muxer "h264" que escreve
+  //    Annex-B direto em arquivo via avio_open)
+  // =================================================================
+  if (avformat_alloc_output_context2(&out_ctx_h264, NULL, "h264",
+                                     OUTPUT_H264_FILENAME) < 0 ||
+      !out_ctx_h264) {
+    fprintf(stderr, "Erro ao criar contexto H.264 raw.\n");
+    goto cleanup;
+  }
+
+  st_h264 = avformat_new_stream(out_ctx_h264, NULL);
+  if (!st_h264)
+    goto cleanup;
+  if (avcodec_parameters_from_context(st_h264->codecpar, enc_ctx) < 0)
+    goto cleanup;
+  st_h264->time_base = enc_ctx->time_base;
+
+  if (!(out_ctx_h264->oformat->flags & AVFMT_NOFILE)) {
+    if (avio_open(&out_ctx_h264->pb, OUTPUT_H264_FILENAME, AVIO_FLAG_WRITE) <
+        0) {
+      fprintf(stderr, "Erro ao abrir %s\n", OUTPUT_H264_FILENAME);
+      goto cleanup;
+    }
+  }
+  if (avformat_write_header(out_ctx_h264, NULL) < 0) {
+    fprintf(stderr, "Erro ao escrever header H.264.\n");
+    goto cleanup;
+  }
+
+  // =================================================================
+  // 6. Frames e pacotes
+  // =================================================================
+  enc_frame = av_frame_alloc();
+  if (!enc_frame)
+    goto cleanup;
+  enc_frame->format = enc_ctx->pix_fmt;
+  enc_frame->width = enc_ctx->width;
+  enc_frame->height = enc_ctx->height;
+  if (av_frame_get_buffer(enc_frame, 32) < 0)
+    goto cleanup;
+
+  dec_frame = av_frame_alloc();
+  if (!dec_frame)
+    goto cleanup;
+
+  in_pkt = av_packet_alloc();
+  out_pkt = av_packet_alloc();
+  if (!in_pkt || !out_pkt)
+    goto cleanup;
+
+  // =================================================================
+  // 7. Loop principal
+  // =================================================================
+  start_time = av_gettime_relative();
+
+  while (1) {
+    ret = av_read_frame(in_ctx, in_pkt);
+    if (ret < 0)
+      break;
+    if (in_pkt->stream_index != video_idx) {
+      av_packet_unref(in_pkt);
+      continue;
     }
 
-    // Find the first video stream
-    for (int i = 0; i < pFormatCtx->nb_streams; i++)
-    {
-        if (pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-        {
-            pVideoStream = pFormatCtx->streams[i];
-            videoStreamIndex = i;
-            break;
+    ret = avcodec_send_packet(dec_ctx, in_pkt);
+    av_packet_unref(in_pkt);
+    if (ret < 0) {
+      fprintf(stderr, "Erro send_packet decoder.\n");
+      goto cleanup;
+    }
+
+    while (1) {
+      ret = avcodec_receive_frame(dec_ctx, dec_frame);
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+        break;
+      if (ret < 0) {
+        fprintf(stderr, "Erro receive_frame decoder.\n");
+        goto cleanup;
+      }
+
+      // Sanidade: formato do frame da câmera
+      if (dec_frame->format < 0 || dec_frame->width <= 0 ||
+          dec_frame->height <= 0) {
+        av_frame_unref(dec_frame);
+        continue;
+      }
+
+      // Cria sws sob demanda (pix_fmt real só agora é conhecido)
+      if (!sws_ctx) {
+        sws_ctx = sws_getContext(
+            dec_frame->width, dec_frame->height,
+            (enum AVPixelFormat)dec_frame->format, enc_ctx->width,
+            enc_ctx->height, enc_ctx->pix_fmt, SWS_BILINEAR, NULL, NULL, NULL);
+        if (!sws_ctx) {
+          fprintf(stderr, "Erro ao criar sws_ctx.\n");
+          goto cleanup;
         }
-    }
+      }
 
-    if (!pVideoStream)
-    {
-        fprintf (stderr, "Could not find video stream\n");
-        goto end;
-    }
+      if (av_frame_make_writable(enc_frame) < 0)
+        goto cleanup;
 
-    // Get the codec context for the video stream
-    pCodecCtx = avcodec_alloc_context3 (NULL);
-    if (!pCodecCtx)
-    {
-        fprintf (stderr, "Could not allocate codec context\n");
-        goto end;
-    }
-    ret = avcodec_parameters_to_context (pCodecCtx, pVideoStream->codecpar);
-    if (ret < 0)
-    {
-        fprintf (stderr, "Could not copy codec parameters to codec context\n");
-        goto end;
-    }
+      sws_scale(sws_ctx, (const uint8_t *const *)dec_frame->data,
+                dec_frame->linesize, 0, dec_frame->height, enc_frame->data,
+                enc_frame->linesize);
 
-    // Find the codec for the video stream
-    pCodec = avcodec_find_decoder (pCodecCtx->codec_id);
-    if (!pCodec)
-    {
-        fprintf (stderr, "Could not find codec\n
+      enc_frame->pts =
+          av_rescale_q(frame_count, (AVRational){1, FPS}, enc_ctx->time_base);
 
-    }
+      ret = avcodec_send_frame(enc_ctx, enc_frame);
+      if (ret < 0) {
+        fprintf(stderr, "Erro send_frame encoder.\n");
+        goto cleanup;
+      }
 
-    // Open codec
-    if ((ret = avcodec_open2 (pCodecCtx, pCodec, &opts)) < 0)
-    {
-        fprintf (stderr, "Could not open codec\n");
-        goto end;
-    }
-
-    // Allocate frame buffer
-    pFrame = av_frame_alloc();
-    if (!pFrame)
-    {
-        fprintf (stderr, "Could not allocate frame buffer\n");
-        goto end;
-    }
-
-    // Open output file for H.264
-    pH264File = fopen (OUTPUT_H264_FILENAME, "wb");
-    if (!pH264File)
-    {
-        fprintf (stderr, "Could not open output file %s\n", OUTPUT_H264_FILENAME);
-        goto end;
-    }
-
-    // Initialize H.264 output format
-    pOutputFmtH264 = av_guess_format ("h264", NULL, NULL);
-    if (!pOutputFmtH264)
-    {
-        fprintf (stderr, "Could not guess H.264 output format\n");
-        goto end;
-    }
-
-    // Create output format context for H.264
-    ret = avformat_alloc_output_context2 (&pFormatCtxH264, pOutputFmtH264, NULL,
-                                          NULL);
-    if (ret < 0)
-    {
-        fprintf (stderr, "Could not create output format context for H.264\n");
-        goto end;
-    }
-
-    // Create output stream for H.264
-    pStreamH264 = avformat_new_stream (pFormatCtxH264, NULL);
-    if (!pStreamH264)
-    {
-        fprintf (stderr, "Could not create output stream for H.264\n");
-        goto end;
-    }
-
-    // Get codec context for H.264
-    pCodecCtxH264 = avcodec_alloc_context3 (NULL);
-    if (!pCodecCtxH264)
-    {
-        fprintf (stderr, "Could not allocate codec context for H.264\n");
-        goto end;
-    }
-    pCodecH264 = avcodec_find_encoder (pOutputFmtH264->video_codec);
-    if (!pCodecH264)
-    {
-        fprintf (stderr, "Could not find encoder for H.264\n");
-        goto end;
-    }
-    pCodecCtxH264->codec_id = pOutputFmtH264->video_codec;
-    pCodecCtxH264->width = pCodecCtx->width;
-    pCodecCtxH264->height = pCodecCtx->height;
-    pCodecCtxH264->time_base = pCodecCtx->time_base;
-    pCodecCtxH264->pix_fmt = pCodecCtx->pix_fmt;
-    pCodecCtxH264->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    if ((ret = avcodec_open2 (pCodecCtxH264, pCodecH264, NULL)) < 0)
-    {
-        fprintf (stderr, "Could not open codec for H.264\n");
-        goto end;
-    }
-
-    // Copy codec parameters from input stream to output stream
-    ret = avcodec_parameters_from_context (pStreamH264->codecpar, pCodecCtxH264);
-    if (ret < 0)
-    {
-        fprintf (stderr,
-                 "Could not copy codec parameters to output stream for H.264\n");
-        goto end;
-    }
-
-    // Write header to output format context for H.264
-    ret = avformat_write_header (pFormatCtxH264, NULL);
-    if (ret < 0)
-    {
-        fprintf (stderr, "Could not write header to output format context for H.264\n");
-        goto end;
-    }
-
-    // Open output file for MP4
-    pMp4File = fopen (OUTPUT_MP4_FILENAME, "wb");
-    if (!pMp4File)
-    {
-        fprintf (stderr, "Could not open output file %s\n", OUTPUT_MP4_FILENAME);
-
-
-        goto end;
-    }
-
-    // Initialize MP4 output format
-    pOutputFmtMP4 = av_guess_format ("mp4", NULL, NULL);
-    if (!pOutputFmtMP4)
-    {
-        fprintf (stderr, "Could not guess MP4 output format\n");
-        goto end;
-    }
-
-    // Create output format context for MP4
-    ret = avformat_alloc_output_context2 (&pFormatCtxMP4, pOutputFmtMP4, NULL,
-                                          NULL);
-    if (ret < 0)
-    {
-        fprintf (stderr, "Could not create output format context for MP4\n");
-        goto end;
-    }
-
-    // Create output stream for MP4
-    pStreamMP4 = avformat_new_stream (pFormatCtxMP4, NULL);
-    if (!pStreamMP4)
-    {
-        fprintf (stderr, "Could not create output stream for MP4\n");
-        goto end;
-    }
-
-    // Get codec context for MP4
-    pCodecCtxMP4 = avcodec_alloc_context3 (NULL);
-    if (!pCodecCtxMP4)
-    {
-        fprintf (stderr, "Could not allocate codec context for MP4\n");
-        goto end;
-    }
-    pCodecMP4 = avcodec_find_encoder (pOutputFmtMP4->video_codec);
-    if (!pCodecMP4)
-    {
-        fprintf (stderr, "Could not find encoder for MP4\n");
-        goto end;
-    }
-    pCodecCtxMP4->codec_id = pOutputFmtMP4->video_codec;
-    pCodecCtxMP4->width = pCodecCtx->width;
-    pCodecCtxMP4->height = pCodecCtx->height;
-    pCodecCtxMP4->time_base = pCodecCtx->time_base;
-    pCodecCtxMP4->pix_fmt = pCodecCtx->pix_fmt;
-    if ((ret = avcodec_open2 (pCodecCtxMP4, pCodecMP4, NULL)) < 0)
-    {
-        fprintf (stderr, "Could not open codec for MP4\n");
-        goto end;
-    }
-
-    // Copy codec parameters from input stream to output stream
-    ret = avcodec_parameters_from_context (pStreamMP4->codecpar, pCodecCtxMP4);
-    if (ret < 0)
-    {
-        fprintf (stderr, "Could not copy codec parameters to output stream for MP4\n");
-        goto end;
-    }
-
-    // Write header to output format context for MP4
-    ret = avformat_write_header (pFormatCtxMP4, NULL);
-    if (ret < 0)
-    {
-        fprintf (stderr, "Could not write header to output format context for MP4\n");
-        goto end;
-    }
-
-    // Read frames and write to output files
-    while (av_read_frame (pFormatCtx, &packet) >= 0)
-    {
-        if (packet.stream_index == videoStreamIndex)
-        {
-            // Decode video frame
-            ret = avcodec_send_packet (pCodecCtx, &packet);
-            if (ret < 0)
-            {
-                fprintf (stderr, "Error sending packet to decoder\n");
-                goto end;
-            }
-            while (ret >= 0)
-            {
-                ret = avcodec_receive_frame (pCodecCtx, pFrame);
-                if (ret == AVERROR (EAGAIN) || ret == AVERROR_EOF)
-                {
-                    break;
-                }
-                else if (ret < 0)
-                {
-                    fprintf (stderr, "Error receiving frame from decoder\n");
-                    goto end;
-                }
-
-                // Calculate start time
-                if (start_time == 0)
-                {
-                    start_time = av_gettime();
-                }
-
-                // Calculate end time and duration
-                end_time = av_gettime();
-                duration = end_time - start_time;
-
-                // Write frame to H.264 file
-                pFrame
-                ->pts = next_pts;
-                next_pts += av_rescale_q (1, pCodecCtx->time_base, pStreamH264->time_base);
-                ret = avcodec_send_frame (pCodecCtxH264, pFrame);
-                if (ret < 0)
-                {
-                    fprintf (stderr, "Error sending frame to H.264 encoder\n");
-                    goto end;
-                }
-                while (ret >= 0)
-                {
-                    ret = avcodec_receive_packet (pCodecCtxH264, &packet);
-                    if (ret == AVERROR (EAGAIN) || ret == AVERROR_EOF)
-                    {
-                        break;
-                    }
-                    else if (ret < 0)
-                    {
-                        fprintf (stderr, "Error receiving packet from H.264 encoder\n");
-                        goto end;
-                    }
-
-                    // Write packet to H.264 file
-                    av_packet_rescale_ts (&packet, pCodecCtxH264->time_base,
-                                          pStreamH264->time_base);
-                    packet.stream_index = pStreamH264->index;
-                    av_write_frame (pFormatCtxH264, &packet);
-
-                    // Write packet to MP4 file
-                    av_packet_rescale_ts (&packet, pCodecCtxH264->time_base, pStreamMP4->time_base);
-                    packet.stream_index = pStreamMP4->index;
-                    av_write_frame (pFormatCtxMP4, &packet);
-
-                    // Increment frame count
-                    frameCount++;
-
-                    // Calculate next PTS
-                    if (last_pts != AV_NOPTS_VALUE)
-                    {
-                        pts_diff = packet.pts - last_pts;
-                        if (pts_diff > 0)
-                        {
-                            next_pts += pts_diff;
-                        }
-                        else
-                        {
-                            next_pts += av_rescale_q (1, pStreamH264->time_base, AV_TIME_BASE_Q);
-                        }
-                    }
-                    last_pts = packet.pts;
-
-                    // Check if we've reached the target duration
-                    if (duration >= target_duration)
-                    {
-                        goto end;
-                    }
-
-                    av_packet_unref (&packet);
-                }
-            }
+      while (ret >= 0) {
+        ret = avcodec_receive_packet(enc_ctx, out_pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+          break;
+        if (ret < 0) {
+          fprintf(stderr, "Erro receive_packet encoder.\n");
+          goto cleanup;
         }
-        av_packet_unref (&packet);
+
+        // ---------- mux para MP4 ----------
+        out_pkt->stream_index = st_mp4->index;
+        av_packet_rescale_ts(out_pkt, enc_ctx->time_base, st_mp4->time_base);
+        if (av_interleaved_write_frame(out_ctx_mp4, out_pkt) < 0) {
+          fprintf(stderr, "Erro ao gravar no MP4.\n");
+          goto cleanup;
+        }
+
+        // ---------- mux para H.264 raw ----------
+        // Reaproveita o mesmo pacote; stream_index e time_base
+        // são idênticos (mesmo encoder), então só reindexamos.
+        out_pkt->stream_index = st_h264->index;
+        av_packet_rescale_ts(out_pkt, enc_ctx->time_base, st_h264->time_base);
+        if (av_interleaved_write_frame(out_ctx_h264, out_pkt) < 0) {
+          fprintf(stderr, "Erro ao gravar no H.264.\n");
+          goto cleanup;
+        }
+
+        av_packet_unref(out_pkt);
+      }
+
+      frame_count++;
+      av_frame_unref(dec_frame);
+
+      if ((av_gettime_relative() - start_time) / 1000000 >= TARGET_DURATION_S)
+        break;
     }
 
-    // Write trailer to output format context for H.264
-    av_write_trailer (pFormatCtxH264);
+    if ((av_gettime_relative() - start_time) / 1000000 >= TARGET_DURATION_S)
+      break;
+  }
 
-    // Write trailer to output format context for MP4
-    av_write_trailer (pFormatCtxMP4);
+  // =================================================================
+  // 8. Flush do encoder
+  // =================================================================
+  avcodec_send_frame(enc_ctx, NULL);
+  while (1) {
+    ret = avcodec_receive_packet(enc_ctx, out_pkt);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+      break;
+    if (ret < 0)
+      break;
 
-    printf ("Wrote %d frames to %s and %s\n", frameCount, OUTPUT_H264_FILENAME,
-            OUTPUT_MP4_FILENAME);
+    out_pkt->stream_index = st_mp4->index;
+    av_packet_rescale_ts(out_pkt, enc_ctx->time_base, st_mp4->time_base);
+    av_interleaved_write_frame(out_ctx_mp4, out_pkt);
 
-end:
-    // Free resources
-    if (pCodecCtxH264)
-    {
-        avcodec_free_context (&pCodecCtxH264);
-    }
-    if (pCodecCtxMP4)
-    {
-        avcodec_free_context (&pCodecCtxMP4);
-    }
-    if (pCodecCtx)
-    {
-        avcodec_free_context (&pCodecCtx);
-    }
-    if (pFrame)
-    {
-        av_frame_free (&pFrame);
-    }
-    if (pFormatCtx)
-    {
-        avformat_close_input (&pFormatCtx);
-    }
-    if (pH264File)
-    {
-        fclose (pH264File);
-    }
-    if (pMp4File)
-    {
-        fclose (pMp4File);
-    }
-    if (pFormatCtxH264)
-    {
-        avformat_free_context (pFormatCtxH264);
-    }
-    if (pFormatCtxMP4)
-    {
-        avformat_free_context (pFormatCtxMP4);
-    }
+    out_pkt->stream_index = st_h264->index;
+    av_packet_rescale_ts(out_pkt, enc_ctx->time_base, st_h264->time_base);
+    av_interleaved_write_frame(out_ctx_h264, out_pkt);
 
-    return ret < 0;
+    av_packet_unref(out_pkt);
+  }
 
+  // =================================================================
+  // 9. Fecha os muxers
+  // =================================================================
+  av_write_trailer(out_ctx_mp4);
+  av_write_trailer(out_ctx_h264);
+
+  fprintf(stderr, "OK: %d frames gravados em %s e %s\n", frame_count,
+          OUTPUT_H264_FILENAME, OUTPUT_MP4_FILENAME);
+  ret = 0;
+
+cleanup:
+  if (sws_ctx)
+    sws_freeContext(sws_ctx);
+  av_frame_free(&enc_frame);
+  av_frame_free(&dec_frame);
+  av_packet_free(&in_pkt);
+  av_packet_free(&out_pkt);
+  avcodec_free_context(&enc_ctx);
+  avcodec_free_context(&dec_ctx);
+  avformat_close_input(&in_ctx);
+
+  if (out_ctx_mp4) {
+    if (out_ctx_mp4->pb)
+      avio_closep(&out_ctx_mp4->pb);
+    avformat_free_context(out_ctx_mp4);
+  }
+  if (out_ctx_h264) {
+    if (out_ctx_h264->pb)
+      avio_closep(&out_ctx_h264->pb);
+    avformat_free_context(out_ctx_h264);
+  }
+
+  return ret;
 }
-
-//
-/* Este código usa a biblioteca libffmpeg para ler do dispositivo /dev/video0 e gravar 10 segundos de vídeo sem áudio em dois arquivos de saída: output.h264 e output.mp4. O vídeo é codificado em H.264 usando o codec x264 e, em seguida, os pac */
