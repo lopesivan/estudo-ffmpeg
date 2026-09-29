@@ -34,6 +34,6 @@ run: $(CONAN_BUILD_DIR)/video-app arquivo.mp4
 	$(CONAN_BUILD_DIR)/video-app arquivo.mp4
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) *.ppm
 
 rebuild: clean build
